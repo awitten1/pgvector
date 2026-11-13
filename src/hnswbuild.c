@@ -48,6 +48,7 @@
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_type_d.h"
+#include "common/pg_prng.h"
 #include "commands/progress.h"
 #include "hnsw.h"
 #include "miscadmin.h"
@@ -72,6 +73,11 @@
 #define PARALLEL_KEY_HNSW_SHARED		UINT64CONST(0xA000000000000001)
 #define PARALLEL_KEY_HNSW_AREA			UINT64CONST(0xA000000000000002)
 #define PARALLEL_KEY_QUERY_TEXT			UINT64CONST(0xA000000000000003)
+#define PARALLEL_KEY_HNSW_CENTROID		UINT64CONST(0xA000000000000004)
+
+/* Sampling for the RaBitQ centroid */
+#define HNSW_CENTROID_SAMPLE_ROWS 50000
+#define HNSW_CENTROID_SAMPLE_ROWS_PER_BLOCK 32
 
 #define HNSW_MAX_GRAPH_MEMORY (SIZE_MAX / 2)
 
@@ -98,10 +104,13 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->dimensions = buildstate->dimensions;
 	metap->m = buildstate->m;
 	metap->efConstruction = buildstate->efConstruction;
+	metap->rabitqBits = buildstate->rabitqBits;
+	metap->rabitqCodesOnly = buildstate->rabitqCodesOnly ? 1 : 0;
 	metap->entryBlkno = InvalidBlockNumber;
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
 	metap->insertPage = InvalidBlockNumber;
+	metap->centroidBlkno = HNSW_METAPAGE_BLKNO;
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
@@ -175,6 +184,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
+		/* Store the code instead of the value */
+		if (buildstate->rabitqCodesOnly)
+			valuePtr = HnswRabitqFormCode(buildstate->rabitq, valuePtr);
+
 		/* Update iterator */
 		iter = element->next;
 
@@ -182,7 +195,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		memset(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		etupSize = HnswRabitqElementTupleSize(buildstate->rabitq, VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -192,7 +205,11 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
-		HnswSetElementTuple(base, etup, element);
+		HnswSetElementTuple(base, etup, element, valuePtr);
+		HnswRabitqSetElementTuple(buildstate->rabitq, etup);
+
+		if (buildstate->rabitqCodesOnly)
+			pfree(valuePtr);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -291,6 +308,70 @@ WriteNeighborTuples(HnswBuildState * buildstate)
 }
 
 /*
+ * Create centroid pages
+ *
+ * These are added after the graph pages since the first graph page has a
+ * fixed location, and are not part of the chain of graph pages
+ */
+static void
+CreateCentroidPages(HnswBuildState * buildstate)
+{
+	Relation	index = buildstate->index;
+	ForkNumber	forkNum = buildstate->forkNum;
+	int			dimensions = buildstate->dimensions;
+	BlockNumber firstBlkno = InvalidBlockNumber;
+	Buffer		prevbuf = InvalidBuffer;
+	Buffer		buf;
+	Page		page;
+	HnswCentroidTuple ctup;
+
+	if (buildstate->centroid == NULL)
+		return;
+
+	ctup = palloc0(HNSW_CENTROID_TUPLE_SIZE(HNSW_CENTROID_MAX_VALUES));
+
+	for (int offset = 0; offset < dimensions; offset += HNSW_CENTROID_MAX_VALUES)
+	{
+		int			count = Min(HNSW_CENTROID_MAX_VALUES, dimensions - offset);
+
+		buf = HnswNewBuffer(index, forkNum);
+		page = BufferGetPage(buf);
+		HnswInitPage(buf, page);
+
+		ctup->type = HNSW_CENTROID_TUPLE_TYPE;
+		ctup->count = count;
+		memcpy(ctup->values, buildstate->centroid + offset, count * sizeof(float));
+
+		if (PageAddItem(page, (Item) ctup, HNSW_CENTROID_TUPLE_SIZE(count), InvalidOffsetNumber, false, false) != FirstOffsetNumber)
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+		/* Link from previous page */
+		if (BufferIsValid(prevbuf))
+		{
+			HnswPageGetOpaque(BufferGetPage(prevbuf))->nextblkno = BufferGetBlockNumber(buf);
+			MarkBufferDirty(prevbuf);
+			UnlockReleaseBuffer(prevbuf);
+		}
+		else
+			firstBlkno = BufferGetBlockNumber(buf);
+
+		prevbuf = buf;
+	}
+
+	MarkBufferDirty(prevbuf);
+	UnlockReleaseBuffer(prevbuf);
+
+	/* Update metapage */
+	buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	HnswPageGetMeta(BufferGetPage(buf))->centroidBlkno = firstBlkno;
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+
+	pfree(ctup);
+}
+
+/*
  * Flush pages
  */
 static void
@@ -303,6 +384,7 @@ FlushPages(HnswBuildState * buildstate)
 	CreateMetaPage(buildstate);
 	CreateGraphPages(buildstate);
 	WriteNeighborTuples(buildstate);
+	CreateCentroidPages(buildstate);
 
 	buildstate->graph->flushed = true;
 	MemoryContextReset(buildstate->graphCtx);
@@ -534,6 +616,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 		{
 			ereport(NOTICE,
 					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+					 buildstate->rabitqCodesOnly ?
+					 errdetail("Building will take significantly more time, and the rest of the graph will be built with estimated distances.") :
 					 errdetail("Building will take significantly more time."),
 					 errhint("Increase maintenance_work_mem to speed up builds.")));
 
@@ -701,7 +785,11 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("column does not have dimensions")));
 
-	if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
+	buildstate->rabitqBits = HnswGetRabitqBits(index);
+	buildstate->rabitqCodesOnly = buildstate->rabitqBits > 0 && !HnswGetRabitqKeepVectors(index);
+
+	/* Only codes need to fit on a page (checked below) */
+	if (buildstate->dimensions > buildstate->typeInfo->maxDimensions && !buildstate->rabitqCodesOnly)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("column cannot have more than %d dimensions for hnsw index", buildstate->typeInfo->maxDimensions)));
@@ -716,6 +804,20 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
+
+	/* Set up RaBitQ */
+	buildstate->rabitq = NULL;
+	buildstate->centroid = NULL;
+	if (buildstate->rabitqBits > 0)
+	{
+		buildstate->rabitq = HnswRabitqInit(&buildstate->support, buildstate->dimensions, buildstate->rabitqBits, buildstate->rabitqCodesOnly, NULL);
+
+		if (HnswRabitqMaxElementTupleSize(buildstate->rabitq) > HNSW_MAX_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("rabitq_bits is too large for %d dimensions", buildstate->dimensions),
+					 errhint("Each element must fit on a single index page.")));
+	}
 
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));
 	buildstate->graph = &buildstate->graphData;
@@ -784,7 +886,7 @@ ParallelHeapScan(HnswBuildState * buildstate)
  * Perform a worker's portion of a parallel insert
  */
 static void
-HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, bool progress)
+HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnswshared, char *hnswarea, float *centroid, bool progress)
 {
 	HnswBuildState buildstate;
 	TableScanDesc scan;
@@ -795,6 +897,11 @@ HnswParallelScanAndInsert(Relation heapRel, Relation indexRel, HnswShared * hnsw
 	indexInfo = BuildIndexInfo(indexRel);
 	indexInfo->ii_Concurrent = hnswshared->isconcurrent;
 	InitBuildState(&buildstate, heapRel, indexRel, indexInfo, MAIN_FORKNUM);
+	if (centroid != NULL && buildstate.rabitq != NULL)
+	{
+		buildstate.centroid = centroid;
+		HnswRabitqSetCentroid(buildstate.rabitq, centroid);
+	}
 	buildstate.graph = &hnswshared->graphData;
 	buildstate.hnswarea = hnswarea;
 	InitAllocator(&buildstate.allocator, &HnswSharedMemoryAlloc, &buildstate);
@@ -835,6 +942,7 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 	char	   *sharedquery;
 	HnswShared *hnswshared;
 	char	   *hnswarea;
+	float	   *centroid;
 	Relation	heapRel;
 	Relation	indexRel;
 	LOCKMODE	heapLockmode;
@@ -868,8 +976,11 @@ HnswParallelBuildMain(dsm_segment *seg, shm_toc *toc)
 
 	hnswarea = shm_toc_lookup(toc, PARALLEL_KEY_HNSW_AREA, false);
 
+	/* Not present if the centroid is the origin */
+	centroid = shm_toc_lookup(toc, PARALLEL_KEY_HNSW_CENTROID, true);
+
 	/* Perform inserts */
-	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, false);
+	HnswParallelScanAndInsert(heapRel, indexRel, hnswshared, hnswarea, centroid, false);
 
 	/* Close relations within worker */
 	index_close(indexRel, indexLockmode);
@@ -910,7 +1021,7 @@ HnswLeaderParticipateAsWorker(HnswBuildState * buildstate)
 	HnswLeader *hnswleader = buildstate->hnswleader;
 
 	/* Perform work common to all participants */
-	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->hnswarea, true);
+	HnswParallelScanAndInsert(buildstate->heap, buildstate->index, hnswleader->hnswshared, hnswleader->hnswarea, buildstate->centroid, true);
 }
 
 /*
@@ -962,6 +1073,13 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 	shm_toc_estimate_chunk(&pcxt->estimator, esthnswarea);
 	shm_toc_estimate_keys(&pcxt->estimator, 2);
 
+	/* Estimate PARALLEL_KEY_HNSW_CENTROID space */
+	if (buildstate->centroid != NULL)
+	{
+		shm_toc_estimate_chunk(&pcxt->estimator, mul_size(sizeof(float), buildstate->dimensions));
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+
 	/* Finally, estimate PARALLEL_KEY_QUERY_TEXT space */
 	if (debug_query_string)
 	{
@@ -1005,6 +1123,16 @@ HnswBeginParallel(HnswBuildState * buildstate, bool isconcurrent, int request)
 
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_SHARED, hnswshared);
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_AREA, hnswarea);
+
+	/* Share the centroid */
+	if (buildstate->centroid != NULL)
+	{
+		Size		centroidSize = mul_size(sizeof(float), buildstate->dimensions);
+		float	   *sharedCentroid = (float *) shm_toc_allocate(pcxt->toc, centroidSize);
+
+		memcpy(sharedCentroid, buildstate->centroid, centroidSize);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_HNSW_CENTROID, sharedCentroid);
+	}
 
 	/* Store query string for workers */
 	if (debug_query_string)
@@ -1069,12 +1197,124 @@ ComputeParallelWorkers(Relation heap, Relation index)
 }
 
 /*
+ * Callback for sampling the table for the centroid
+ */
+static void
+CentroidCallback(Relation index, ItemPointer tid, Datum *values,
+				 bool *isnull, bool tupleIsAlive, void *state)
+{
+	HnswBuildState *buildstate = (HnswBuildState *) state;
+	MemoryContext oldCtx;
+	Datum		value;
+
+	/* Skip nulls */
+	if (isnull[0])
+		return;
+
+	/* Limit rows per block before detoasting */
+	if (buildstate->centroidBlockSamples >= HNSW_CENTROID_SAMPLE_ROWS_PER_BLOCK)
+		return;
+
+	/* Use memory context since detoast can allocate */
+	oldCtx = MemoryContextSwitchTo(buildstate->tmpCtx);
+
+	/* Use the same value as the index (detoasted and normalized if needed) */
+	if (HnswFormIndexValue(&value, values, isnull, buildstate->typeInfo, &buildstate->support))
+	{
+		HnswCheckDim(buildstate->dimensions, buildstate->typeInfo, buildstate->support.collation, value);
+		HnswRabitqAddToSums(buildstate->rabitq, DatumGetPointer(value), buildstate->centroidSums);
+		buildstate->centroidSamples++;
+		buildstate->centroidBlockSamples++;
+	}
+
+	/* Reset memory context */
+	MemoryContextSwitchTo(oldCtx);
+	MemoryContextReset(buildstate->tmpCtx);
+}
+
+static uint64
+Gcd(uint64 a, uint64 b)
+{
+	while (b != 0)
+	{
+		uint64		t = a % b;
+
+		a = b;
+		b = t;
+	}
+
+	return a;
+}
+
+/*
+ * Calculate the centroid for RaBitQ from a sample of the table
+ *
+ * Only the mean is needed, so samples are not stored. Blocks are visited in
+ * a pseudo-random order (a random start and step) until there are enough
+ * samples, with a limit on rows per block to reduce the effect of similar
+ * rows being stored together. This reads the entire table only if it does
+ * not have enough rows.
+ */
+static void
+SampleCentroid(HnswBuildState * buildstate)
+{
+	int			dimensions = buildstate->dimensions;
+	uint64		totalblocks = RelationGetNumberOfBlocks(buildstate->heap);
+	uint64		start;
+	uint64		step;
+
+	if (totalblocks == 0)
+		return;
+
+	buildstate->centroidSums = palloc0(mul_size(sizeof(double), dimensions));
+	buildstate->centroidSamples = 0;
+
+	/* A step with no common factors visits every block once */
+	start = pg_prng_uint64_range(&pg_global_prng_state, 0, totalblocks - 1);
+	do
+	{
+		step = pg_prng_uint64_range(&pg_global_prng_state, 1, totalblocks);
+	} while (Gcd(step, totalblocks) != 1);
+
+	for (uint64 i = 0; i < totalblocks && buildstate->centroidSamples < HNSW_CENTROID_SAMPLE_ROWS; i++)
+	{
+		/* Block numbers are 32 bits, so this cannot overflow */
+		BlockNumber targblock = (BlockNumber) ((start + i * step) % totalblocks);
+
+		CHECK_FOR_INTERRUPTS();
+
+		buildstate->centroidBlockSamples = 0;
+
+		/* Set anyvisible to false like table_index_build_scan */
+		table_index_build_range_scan(buildstate->heap, buildstate->index, buildstate->indexInfo,
+									 false, false, false, targblock, 1, CentroidCallback, (void *) buildstate, NULL);
+	}
+
+	/* Use the origin if no rows */
+	if (buildstate->centroidSamples > 0)
+	{
+		buildstate->centroid = palloc(mul_size(sizeof(float), dimensions));
+		for (int i = 0; i < dimensions; i++)
+			buildstate->centroid[i] = buildstate->centroidSums[i] / buildstate->centroidSamples;
+
+		HnswRabitqSetCentroid(buildstate->rabitq, buildstate->centroid);
+	}
+
+	pfree(buildstate->centroidSums);
+	buildstate->centroidSums = NULL;
+}
+
+/*
  * Build graph
  */
 static void
 BuildGraph(HnswBuildState * buildstate)
 {
 	int			parallel_workers = 0;
+
+	/* Calculate the centroid before any values are encoded */
+	if (buildstate->heap != NULL && buildstate->rabitq != NULL)
+		SampleCentroid(buildstate);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_HNSW_PHASE_LOAD);
 

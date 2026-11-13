@@ -12,3 +12,6 @@ regression.*
 *.obj
 *.lib
 *.exp
+/third_party/rabitqlib-build/
+/postgres/
+/.deps/

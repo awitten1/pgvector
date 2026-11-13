@@ -876,6 +876,9 @@ static void
 InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
+	int			dimensions;
+	int			rabitqBits;
+	bool		rabitqCodesOnly;
 
 	if (stats == NULL)
 		stats = palloc0_object(IndexBulkDeleteResult);
@@ -895,7 +898,11 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 	HnswInitSupport(&vacuumstate->support, index);
 
 	/* Get m from metapage */
-	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL, NULL);
+	HnswGetMetaPageInfo(index, &vacuumstate->m, &dimensions, NULL, &rabitqBits, &rabitqCodesOnly);
+
+	/* Values are codes, so the graph is repaired with estimated distances */
+	if (rabitqCodesOnly)
+		vacuumstate->support.codes = HnswRabitqInit(&vacuumstate->support, dimensions, rabitqBits, true, index);
 
 	/* Create hash table */
 	vacuumstate->deleting = tidhash_create(CurrentMemoryContext, 256, NULL);

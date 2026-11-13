@@ -32,18 +32,21 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	List	   *w;
 	int			m;
 	int			dimensions;
+	int			rabitqBits;
+	bool		rabitqCodesOnly;
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
 	/* Get m, dimensions, and entry point */
-	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits, &rabitqCodesOnly);
 
 	/* Check dimensions match index */
 	if (DatumGetPointer(value) != NULL)
 		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
 	q->value = value;
+	q->rabitq = HnswRabitqBeginScan(index, support, value, dimensions, rabitqBits, rabitqCodesOnly);
 	so->m = m;
 
 	if (entryPoint == NULL)
@@ -143,6 +146,15 @@ hnswbeginscan(Relation index, int nkeys, int norderbys)
 
 	so = palloc_object(HnswScanOpaqueData);
 	so->typeInfo = HnswGetTypeInfo(index);
+	so->q.rabitq = NULL;
+
+	/* For RaBitQ, which has the executor recheck distances */
+	if (norderbys > 0)
+	{
+		scan->xs_orderbyvals = palloc0(mul_size(sizeof(Datum), norderbys));
+		scan->xs_orderbynulls = palloc(mul_size(sizeof(bool), norderbys));
+		memset(scan->xs_orderbynulls, true, sizeof(bool) * norderbys);
+	}
 
 	/* Set support functions */
 	HnswInitSupport(&so->support, index);
@@ -181,6 +193,8 @@ hnswrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys, int no
 	so->discarded = NULL;
 	so->tuples = 0;
 	so->previousDistance = -get_float8_infinity();
+	/* Freed by reset */
+	so->q.rabitq = NULL;
 	MemoryContextReset(so->tmpCtx);
 
 	if (keys && scan->numberOfKeys > 0)
@@ -329,7 +343,22 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 
 		scan->xs_heaptid = *heaptid;
 		scan->xs_recheck = false;
-		scan->xs_recheckorderby = false;
+
+		if (so->q.rabitq != NULL)
+		{
+			/*
+			 * RaBitQ estimates are not lower bounds, so report -infinity.
+			 * The executor then computes exact distances, holds every tuple
+			 * until the scan is exhausted, and returns them in exact order.
+			 * This reranks the ef_search candidates.
+			 */
+			scan->xs_recheckorderby = true;
+			scan->xs_orderbyvals[0] = Float8GetDatum(-get_float8_infinity());
+			scan->xs_orderbynulls[0] = false;
+		}
+		else
+			scan->xs_recheckorderby = false;
+
 		return true;
 	}
 

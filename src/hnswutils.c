@@ -143,6 +143,34 @@ HnswGetEfConstruction(Relation index)
 }
 
 /*
+ * Get the bits per dimension for RaBitQ codes in the index
+ */
+int
+HnswGetRabitqBits(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->rabitqBits;
+
+	return 0;
+}
+
+/*
+ * Get whether to store vectors as well as RaBitQ codes
+ */
+bool
+HnswGetRabitqKeepVectors(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->rabitqKeepVectors;
+
+	return false;
+}
+
+/*
  * Get proc
  */
 FmgrInfo *
@@ -163,6 +191,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+	support->codes = NULL;
 }
 
 /*
@@ -309,7 +338,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits, bool *rabitqCodesOnly)
 {
 	Buffer		buf;
 	Page		page;
@@ -329,6 +358,13 @@ HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entry
 	if (dimensions != NULL)
 		*dimensions = metap->dimensions;
 
+	/* Zero for indexes created before the field existed */
+	if (rabitqBits != NULL)
+		*rabitqBits = metap->rabitqBits;
+
+	if (rabitqCodesOnly != NULL)
+		*rabitqCodesOnly = metap->rabitqCodesOnly != 0;
+
 	if (entryPoint != NULL)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
@@ -344,6 +380,62 @@ HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entry
 }
 
 /*
+ * Load the RaBitQ centroid from the index
+ *
+ * Returns NULL if the index does not have one (so codes are relative to
+ * the origin)
+ */
+float *
+HnswLoadCentroid(Relation index, int dimensions)
+{
+	Buffer		buf;
+	Page		page;
+	BlockNumber blkno;
+	float	   *centroid;
+	int			loaded = 0;
+
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	blkno = HnswPageGetMeta(page)->centroidBlkno;
+	UnlockReleaseBuffer(buf);
+
+	/* Zero for indexes created before the field existed */
+	if (blkno == HNSW_METAPAGE_BLKNO || !BlockNumberIsValid(blkno))
+		return NULL;
+
+	centroid = palloc(mul_size(sizeof(float), dimensions));
+
+	while (BlockNumberIsValid(blkno))
+	{
+		HnswCentroidTuple ctup;
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (PageGetMaxOffsetNumber(page) != FirstOffsetNumber)
+			elog(ERROR, "hnsw centroid page is not valid");
+
+		ctup = (HnswCentroidTuple) PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+
+		if (ctup->type != HNSW_CENTROID_TUPLE_TYPE || ctup->count > dimensions - loaded)
+			elog(ERROR, "hnsw centroid page is not valid");
+
+		memcpy(centroid + loaded, ctup->values, ctup->count * sizeof(float));
+		loaded += ctup->count;
+
+		blkno = HnswPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (loaded != dimensions)
+		elog(ERROR, "hnsw centroid is not valid");
+
+	return centroid;
+}
+
+/*
  * Get the entry point
  */
 HnswElement
@@ -351,7 +443,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint, NULL, NULL);
 
 	return entryPoint;
 }
@@ -445,11 +537,13 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 
 /*
  * Set element tuple, except for neighbor info
+ *
+ * Uses the value of the element if value is NULL
  */
 void
-HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
+HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, Pointer value)
 {
-	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Pointer		valuePtr = value != NULL ? value : HnswPtrAccess(base, element->value);
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -540,6 +634,10 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
+	/* Values are codes, so estimate the distance */
+	if (support->codes != NULL)
+		return HnswRabitqSymmetricDistance(support->codes, DatumGetPointer(a), DatumGetPointer(b));
+
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
@@ -550,13 +648,15 @@ static void
 HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
 {
 	Page		page;
+	ItemId		itemid;
 	HnswElementTuple etup;
 
 	/* Read vector */
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	itemid = PageGetItemId(page, offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
 
 	Assert(HnswIsElementTuple(etup));
 
@@ -568,6 +668,8 @@ HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery 
 	{
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
+		else if (q->rabitq != NULL)
+			*distance = HnswRabitqDistance(q->rabitq, etup, ItemIdGetLength(itemid));
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}
@@ -1488,6 +1590,15 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswInitSearchState(&searchState, index, maintenance);
 
 	q.value = HnswGetValue(base, element);
+
+	/*
+	 * When values are codes, use the original value of a new element to
+	 * search (if available), which is more accurate than its code
+	 */
+	if (!existing && support->codes != NULL && HnswRabitqHasQuery(support->codes))
+		q.rabitq = support->codes;
+	else
+		q.rabitq = NULL;
 
 	/* Precompute hash */
 	if (inMemory)

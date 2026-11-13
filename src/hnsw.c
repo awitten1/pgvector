@@ -43,6 +43,7 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 
 int			hnsw_ef_search;
 int			hnsw_iterative_scan;
+int			hnsw_rabitq_bits;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
@@ -98,6 +99,11 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	/* Experimental */
+	add_int_reloption(hnsw_relopt_kind, "rabitq_bits", "Bits per dimension for RaBitQ codes (0 to disable)",
+					  0, 0, 9, AccessExclusiveLock);
+	add_bool_reloption(hnsw_relopt_kind, "rabitq_keep_vectors", "Store vectors as well as RaBitQ codes",
+					   false, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -116,6 +122,11 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* Experimental */
+	DefineCustomIntVariable("hnsw.rabitq_bits", "Sets the bits per dimension for RaBitQ distance estimation in scans",
+							"-1 uses the codes stored in the index (if any), 0 disables RaBitQ, and other values quantize on the fly unless they match the index.", &hnsw_rabitq_bits,
+							-1, -1, 9, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }
@@ -177,7 +188,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		Relation	index;
 
 		index = index_open(indexInfo->indexoid, NoLock);
-		HnswGetMetaPageInfo(index, &m, NULL, NULL);
+		HnswGetMetaPageInfo(index, &m, NULL, NULL, NULL, NULL);
 		index_close(index, NoLock);
 	}
 	else
@@ -257,6 +268,8 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"rabitq_bits", RELOPT_TYPE_INT, offsetof(HnswOptions, rabitqBits)},
+		{"rabitq_keep_vectors", RELOPT_TYPE_BOOL, offsetof(HnswOptions, rabitqKeepVectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,
