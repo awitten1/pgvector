@@ -43,6 +43,7 @@ static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 
 int			hnsw_ef_search;
 int			hnsw_iterative_scan;
+int			hnsw_rabitq_bits;
 int			hnsw_max_scan_tuples;
 double		hnsw_scan_mem_multiplier;
 int			hnsw_lock_tranche_id;
@@ -116,6 +117,11 @@ HnswInit(void)
 	DefineCustomRealVariable("hnsw.scan_mem_multiplier", "Sets the multiple of work_mem to use for iterative scans",
 							 NULL, &hnsw_scan_mem_multiplier,
 							 1, 1, 1000, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	/* Experimental */
+	DefineCustomIntVariable("hnsw.rabitq_bits", "Sets the bits per dimension for RaBitQ distance estimation in scans",
+							"0 disables RaBitQ. Valid range is 0..9.", &hnsw_rabitq_bits,
+							0, 0, 9, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("hnsw");
 }

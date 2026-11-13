@@ -154,6 +154,7 @@ extern int	hnsw_iterative_scan;
 extern int	hnsw_max_scan_tuples;
 extern double hnsw_scan_mem_multiplier;
 extern int	hnsw_lock_tranche_id;
+extern int	hnsw_rabitq_bits;
 
 typedef enum HnswIterativeScanMode
 {
@@ -301,9 +302,12 @@ typedef struct HnswSupport
 	Oid			collation;
 }			HnswSupport;
 
+typedef struct HnswRabitq HnswRabitq;
+
 typedef struct HnswQuery
 {
 	Datum		value;
+	HnswRabitq *rabitq;			/* estimate distances with RaBitQ if not NULL */
 }			HnswQuery;
 
 typedef struct HnswBuildState
@@ -504,6 +508,8 @@ bool		HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswS
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
+HnswRabitq *HnswRabitqBegin(HnswSupport * support, Datum value);
+double		HnswRabitqDistance(HnswRabitq * rabitq, Pointer value);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);

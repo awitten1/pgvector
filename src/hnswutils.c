@@ -568,6 +568,8 @@ HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery 
 	{
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
+		else if (q->rabitq != NULL)
+			*distance = HnswRabitqDistance(q->rabitq, (Pointer) &etup->data);
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}
@@ -1488,6 +1490,7 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswInitSearchState(&searchState, index, maintenance);
 
 	q.value = HnswGetValue(base, element);
+	q.rabitq = NULL;
 
 	/* Precompute hash */
 	if (inMemory)

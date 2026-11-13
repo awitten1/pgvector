@@ -5,6 +5,18 @@ MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
 OBJS = src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+
+# Experimental RaBitQ support (third_party/rabitqlib is a git submodule)
+RABITQ_DIR = third_party/rabitqlib
+RABITQ_BUILD_DIR = third_party/rabitqlib-build
+RABITQ_LIB = $(RABITQ_BUILD_DIR)/librabitq_core.a
+OBJS += src/hnswrabitq.o src/rabitq_shim.o
+# Must match the definitions the library is built with (rabitq_compile_options)
+# CPPFLAGS (not CXXFLAGS) so they also apply to LLVM bitcode
+PG_CPPFLAGS += -I$(RABITQ_DIR)/include -DRABITQ_USE_OPENMP=0 -DEIGEN_MAX_ALIGN_BYTES=64 -DEIGEN_MAX_STATIC_ALIGN_BYTES=64
+# No -march=native so inline Eigen code matches the library build
+PG_CXXFLAGS += -std=c++17 -O2
+SHLIB_LINK += $(RABITQ_LIB) -lstdc++
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
@@ -51,6 +63,26 @@ sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# Postgres builds without LLVM (such as meson builds) may not configure a C++ compiler
+ifeq ($(strip $(CXX)),)
+CXX = c++
+endif
+
+# Build the RaBitQ core library (no ANN indexes, no OpenMP, runtime ISA dispatch)
+$(RABITQ_LIB):
+	@test -f $(RABITQ_DIR)/CMakeLists.txt || { echo "Run: git submodule update --init" >&2; exit 1; }
+	cmake -S $(RABITQ_DIR) -B $(RABITQ_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release \
+		-DRABITQ_BUILD_INDEX=OFF -DRABITQ_BUILD_FASTSCAN=OFF -DRABITQ_USE_OPENMP=OFF \
+		-DRABITQ_BUILD_SAMPLES=OFF -DRABITQ_ENABLE_NATIVE_OPTIMIZATION=OFF \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON
+	cmake --build $(RABITQ_BUILD_DIR) --target rabitq_core --parallel
+
+$(shlib): $(RABITQ_LIB)
+
+.PHONY: rabitq-clean
+rabitq-clean:
+	rm -rf $(RABITQ_BUILD_DIR)
 
 # for Mac
 ifeq ($(PROVE),)

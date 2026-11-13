@@ -500,6 +500,7 @@ GetUpdateIndex(HnswElement element, HnswElement newElement, float distance, int 
 		HnswQuery	q;
 
 		q.value = HnswGetValue(base, element);
+		q.rabitq = NULL;
 
 		LoadElementsForInsert(neighbors, &q, &idx, index, support);
 
