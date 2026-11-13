@@ -151,7 +151,7 @@ my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
 	SET hnsw.rabitq_bits = 1;
 	SELECT i FROM tst ORDER BY v <+> '$queries[0]' LIMIT $limit;
 ));
-like($stderr, qr/hnsw.rabitq_bits only supports/);
+like($stderr, qr/RaBitQ only supports/);
 $node->safe_psql("postgres", "DROP INDEX idx;");
 
 $node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v halfvec_l2_ops);");

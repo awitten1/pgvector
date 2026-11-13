@@ -90,6 +90,8 @@ typedef Pointer Item;
 #define HNSW_TUPLE_ALLOC_SIZE BLCKSZ
 
 #define HNSW_ELEMENT_TUPLE_SIZE(size)	MAXALIGN(add_size(offsetof(HnswElementTupleData, data), size))
+/* An optional RaBitQ code (factors, then code) is stored after the value */
+#define HNSW_ELEMENT_TUPLE_CODE_SIZE(size, codeSize)	MAXALIGN(add_size(HNSW_ELEMENT_TUPLE_SIZE(size), codeSize))
 #define HNSW_NEIGHBOR_TUPLE_SIZE(level, m)	MAXALIGN(add_size(offsetof(HnswNeighborTupleData, indextids), mul_size(sizeof(ItemPointerData), mul_size(add_size(level, 2), m))))
 
 #define HNSW_NEIGHBOR_ARRAY_SIZE(lm)	add_size(offsetof(HnswNeighborArray, items), mul_size(sizeof(HnswCandidate), lm))
@@ -225,6 +227,7 @@ typedef struct HnswOptions
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
+	int			rabitqBits;		/* bits per dimension for RaBitQ codes */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -323,6 +326,8 @@ typedef struct HnswBuildState
 	int			dimensions;
 	int			m;
 	int			efConstruction;
+	int			rabitqBits;
+	HnswRabitq *rabitq;
 
 	/* Statistics */
 	double		indtuples;
@@ -359,6 +364,7 @@ typedef struct HnswMetaPageData
 	OffsetNumber entryOffno;
 	int16		entryLevel;
 	BlockNumber insertPage;
+	uint16		rabitqBits;		/* zero for indexes without RaBitQ codes */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -482,6 +488,7 @@ typedef struct HnswVacuumState
 /* Methods */
 int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
+int			HnswGetRabitqBits(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
@@ -493,7 +500,7 @@ void		HnswInitSearchState(HnswSearchState * searchState, Relation index, bool ma
 void		HnswEndSearchState(HnswSearchState * searchState);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswSearchState * searchState);
 HnswElement HnswGetEntryPoint(Relation index);
-void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint);
+void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
@@ -508,8 +515,13 @@ bool		HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswS
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
-HnswRabitq *HnswRabitqBegin(HnswSupport * support, Datum value);
-double		HnswRabitqDistance(HnswRabitq * rabitq, Pointer value);
+HnswRabitq *HnswRabitqInit(HnswSupport * support, int dimensions, int bits);
+Size		HnswRabitqCodeSize(HnswRabitq * rabitq);
+Size		HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize);
+Size		HnswRabitqMaxElementTupleSize(HnswRabitq * rabitq);
+void		HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup);
+HnswRabitq *HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits);
+double		HnswRabitqDistance(HnswRabitq * rabitq, HnswElementTuple etup, Size etupSize);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);

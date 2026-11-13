@@ -14,24 +14,30 @@
 /*
  * Experimental: estimate distances during HNSW scans with RaBitQ.
  *
- * This is stage 1a of the experiment: the index format is unchanged, and each
- * element's vector is quantized on the fly when it is loaded. That is slower
- * than exact distances, but it shows how recall depends on the rerank depth
- * (ef_search) without changing anything on disk. Reranking is done by the
- * executor (see hnswgettuple).
+ * Indexes created with the rabitq_bits option store a code for each element
+ * after its value in the element tuple (stage 1b). Scans estimate distances
+ * from the stored codes, and the executor reranks with exact distances (see
+ * hnswgettuple). Builds, inserts, and vacuum still use exact distances.
+ *
+ * Scans can also quantize values on the fly (stage 1a), which works with any
+ * index but is slow. This is only useful for measuring recall.
  */
 
-/* Fixed so that results are reproducible */
+/* Fixed so codes and queries always use the same rotation */
 #define HNSW_RABITQ_SEED 42
 
 /* FHT-Kac rotation requirement */
 #define HNSW_RABITQ_MIN_DIM 64
 
+#define HNSW_RABITQ_FACTORS_SIZE (RABITQ_NUM_FACTORS * sizeof(float))
+
 struct HnswRabitq
 {
 	RabitqContext *ctx;
 	bool		isHalf;
+	bool		stored;			/* use codes stored in the index */
 	int			dim;
+	Size		codeBytes;		/* excluding factors */
 	float	   *buf;			/* for converting halfvec to float */
 };
 
@@ -124,49 +130,35 @@ GetFloats(HnswRabitq * rabitq, Pointer value)
 }
 
 /*
- * Prepare RaBitQ for a scan
+ * Set up RaBitQ for an index
  *
- * Returns NULL if RaBitQ is disabled. Allocates in CurrentMemoryContext,
- * and the result is freed when that context is reset.
+ * Allocates in CurrentMemoryContext, and the result is freed when that
+ * context is reset or deleted.
  */
 HnswRabitq *
-HnswRabitqBegin(HnswSupport * support, Datum value)
+HnswRabitqInit(HnswSupport * support, int dimensions, int bits)
 {
 	HnswRabitq *rabitq;
 	MemoryContextCallback *callback;
 	bool		isHalf;
 	RabitqMetric metric;
-	Pointer		ptr;
-	int			dim;
 	char		errbuf[256];
-
-	if (hnsw_rabitq_bits == 0 || DatumGetPointer(value) == NULL)
-		return NULL;
-
-	if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("hnsw.rabitq_bits does not support iterative scans"),
-				 errhint("Set hnsw.iterative_scan = off.")));
 
 	if (!GetTypeAndMetric(support, &isHalf, &metric))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("hnsw.rabitq_bits only supports vector and halfvec with L2, inner product, or cosine distance")));
+				 errmsg("RaBitQ only supports vector and halfvec with L2, inner product, or cosine distance")));
 
-	ptr = (Pointer) PG_DETOAST_DATUM(value);
-	dim = isHalf ? ((HalfVector *) ptr)->dim : ((Vector *) ptr)->dim;
-
-	if (dim < HNSW_RABITQ_MIN_DIM)
+	if (dimensions < HNSW_RABITQ_MIN_DIM)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("hnsw.rabitq_bits requires at least %d dimensions", HNSW_RABITQ_MIN_DIM)));
+				 errmsg("RaBitQ requires at least %d dimensions", HNSW_RABITQ_MIN_DIM)));
 
 	rabitq = palloc0_object(HnswRabitq);
 	rabitq->isHalf = isHalf;
-	rabitq->dim = dim;
+	rabitq->dim = dimensions;
 	if (isHalf)
-		rabitq->buf = palloc(mul_size(sizeof(float), dim));
+		rabitq->buf = palloc(mul_size(sizeof(float), dimensions));
 
 	/* Register cleanup before creating so the context can never leak */
 	callback = palloc_object(MemoryContextCallback);
@@ -174,30 +166,152 @@ HnswRabitqBegin(HnswSupport * support, Datum value)
 	callback->arg = rabitq;
 	MemoryContextRegisterResetCallback(CurrentMemoryContext, callback);
 
-	if (rabitq_create(dim, hnsw_rabitq_bits, metric, HNSW_RABITQ_SEED, &rabitq->ctx, errbuf, sizeof(errbuf)) != 0)
+	if (rabitq_create(dimensions, bits, metric, HNSW_RABITQ_SEED, &rabitq->ctx, errbuf, sizeof(errbuf)) != 0)
 		ReportError("setup", errbuf);
 
-	if (rabitq_set_query(rabitq->ctx, GetFloats(rabitq, ptr), errbuf, sizeof(errbuf)) != 0)
+	rabitq->codeBytes = rabitq_code_bytes(rabitq->ctx);
+
+	return rabitq;
+}
+
+/*
+ * Get the size of the factors and code stored for each element
+ */
+Size
+HnswRabitqCodeSize(HnswRabitq * rabitq)
+{
+	return add_size(HNSW_RABITQ_FACTORS_SIZE, rabitq->codeBytes);
+}
+
+/*
+ * Get the size of an element tuple (rabitq can be NULL)
+ */
+Size
+HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize)
+{
+	if (rabitq == NULL)
+		return HNSW_ELEMENT_TUPLE_SIZE(valueSize);
+
+	return HNSW_ELEMENT_TUPLE_CODE_SIZE(valueSize, HnswRabitqCodeSize(rabitq));
+}
+
+/*
+ * Get the max size of an element tuple
+ */
+Size
+HnswRabitqMaxElementTupleSize(HnswRabitq * rabitq)
+{
+	Size		valueSize = rabitq->isHalf ? HALFVEC_SIZE(rabitq->dim) : VECTOR_SIZE(rabitq->dim);
+
+	return HnswRabitqElementTupleSize(rabitq, valueSize);
+}
+
+/*
+ * Get the location of the factors and code in an element tuple
+ */
+static char *
+GetStoredCode(HnswElementTuple etup)
+{
+	return ((char *) etup) + HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(&etup->data));
+}
+
+/*
+ * Add the code for the value to an element tuple (rabitq can be NULL)
+ *
+ * The value must be set, and the tuple must be allocated with
+ * HnswRabitqElementTupleSize.
+ */
+void
+HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup)
+{
+	char	   *dst;
+	float		factors[RABITQ_NUM_FACTORS];
+	char		errbuf[256];
+
+	if (rabitq == NULL)
+		return;
+
+	dst = GetStoredCode(etup);
+
+	if (rabitq_encode(rabitq->ctx, GetFloats(rabitq, (Pointer) &etup->data), (uint8_t *) dst + HNSW_RABITQ_FACTORS_SIZE, factors, errbuf, sizeof(errbuf)) != 0)
+		ReportError("encoding", errbuf);
+
+	memcpy(dst, factors, HNSW_RABITQ_FACTORS_SIZE);
+}
+
+/*
+ * Prepare RaBitQ for a scan
+ *
+ * Returns NULL to use exact distances. indexBits is the bits per dimension
+ * of the codes stored in the index (zero if none).
+ */
+HnswRabitq *
+HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits)
+{
+	HnswRabitq *rabitq;
+	bool		automatic = hnsw_rabitq_bits < 0;
+	int			bits = automatic ? indexBits : hnsw_rabitq_bits;
+	char		errbuf[256];
+
+	if (bits == 0 || DatumGetPointer(value) == NULL)
+		return NULL;
+
+	if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+	{
+		/* Use exact distances unless RaBitQ was explicitly requested */
+		if (automatic)
+			return NULL;
+
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("hnsw.rabitq_bits does not support iterative scans"),
+				 errhint("Set hnsw.iterative_scan = off.")));
+	}
+
+	rabitq = HnswRabitqInit(support, dimensions, bits);
+
+	/* Quantize on the fly if the index does not have matching codes */
+	rabitq->stored = bits == indexBits;
+
+	if (rabitq_set_query(rabitq->ctx, GetFloats(rabitq, (Pointer) PG_DETOAST_DATUM(value)), errbuf, sizeof(errbuf)) != 0)
 		ReportError("query preparation", errbuf);
 
 	return rabitq;
 }
 
 /*
- * Estimate the distance between the scan query and an element value
+ * Estimate the distance between the scan query and an element
  *
  * The estimate has the same ordering as the support function (squared L2,
  * or 1 - inner product instead of negative inner product), but not the same
  * values, so it must only be compared with other estimates.
  */
 double
-HnswRabitqDistance(HnswRabitq * rabitq, Pointer value)
+HnswRabitqDistance(HnswRabitq * rabitq, HnswElementTuple etup, Size etupSize)
 {
 	float		distance;
 	char		errbuf[256];
 
-	if (rabitq_estimate(rabitq->ctx, GetFloats(rabitq, value), &distance, errbuf, sizeof(errbuf)) != 0)
-		ReportError("estimation", errbuf);
+	if (rabitq->stored)
+	{
+		Size		valueSize = VARSIZE_ANY(&etup->data);
+		char	   *src = GetStoredCode(etup);
+		float		factors[RABITQ_NUM_FACTORS];
+
+		/* Safety check */
+		if (HnswRabitqElementTupleSize(rabitq, valueSize) > etupSize)
+			elog(ERROR, "hnsw element does not have a RaBitQ code");
+
+		memcpy(factors, src, HNSW_RABITQ_FACTORS_SIZE);
+
+		if (rabitq_compute(rabitq->ctx, (const uint8_t *) src + HNSW_RABITQ_FACTORS_SIZE, factors, &distance, errbuf, sizeof(errbuf)) != 0)
+			ReportError("estimation", errbuf);
+	}
+	else
+	{
+		if (rabitq_estimate(rabitq->ctx, GetFloats(rabitq, (Pointer) &etup->data), &distance, errbuf, sizeof(errbuf)) != 0)
+			ReportError("estimation", errbuf);
+	}
 
 	return distance;
 }

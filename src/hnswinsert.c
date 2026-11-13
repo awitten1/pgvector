@@ -146,7 +146,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
  * Add to element and neighbor pages
  */
 static void
-AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInsertPage, bool building)
+AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInsertPage, bool building, HnswRabitq * rabitq)
 {
 	Buffer		buf;
 	Page		page;
@@ -174,7 +174,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInser
 	BlockNumber fsmHistory[HNSW_MAX_FSM_TRIES];
 
 	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	etupSize = HnswRabitqElementTupleSize(rabitq, VARSIZE_ANY(HnswPtrAccess(base, e->value)));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -183,6 +183,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInser
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
 	HnswSetElementTuple(base, etup, e);
+	HnswRabitqSetElementTuple(rabitq, etup);
 
 	/* Prepare neighbor tuple */
 	ntup = palloc0(ntupSize);
@@ -731,7 +732,7 @@ FindDuplicateOnDisk(Relation index, HnswElement element, bool building)
  * Update graph on disk
  */
 static void
-UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, int m, HnswElement entryPoint, bool building)
+UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, int m, HnswElement entryPoint, bool building, HnswRabitq * rabitq)
 {
 	BlockNumber newInsertPage = InvalidBlockNumber;
 
@@ -740,7 +741,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 		return;
 
 	/* Add element */
-	AddElementOnDisk(index, element, m, &newInsertPage, building);
+	AddElementOnDisk(index, element, m, &newInsertPage, building, rabitq);
 
 	/* Update insert page if needed */
 	if (BlockNumberIsValid(newInsertPage))
@@ -765,6 +766,8 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 	int			m;
 	int			efConstruction = HnswGetEfConstruction(index);
 	int			dimensions;
+	int			rabitqBits;
+	HnswRabitq *rabitq = NULL;
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
 
@@ -776,10 +779,14 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	/* Get m, dimensions, and entry point */
-	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint);
+	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits);
 
 	/* Check dimensions match index */
 	HnswCheckDim(dimensions, typeInfo, support->collation, value);
+
+	/* Set up RaBitQ to encode the value (freed with the memory context) */
+	if (rabitqBits > 0)
+		rabitq = HnswRabitqInit(support, dimensions, rabitqBits);
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
@@ -803,7 +810,7 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, false, building);
 
 	/* Update graph on disk */
-	UpdateGraphOnDisk(index, support, element, m, entryPoint, building);
+	UpdateGraphOnDisk(index, support, element, m, entryPoint, building, rabitq);
 
 	/* Release lock */
 	UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);

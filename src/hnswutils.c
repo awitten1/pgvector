@@ -143,6 +143,20 @@ HnswGetEfConstruction(Relation index)
 }
 
 /*
+ * Get the bits per dimension for RaBitQ codes in the index
+ */
+int
+HnswGetRabitqBits(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->rabitqBits;
+
+	return 0;
+}
+
+/*
  * Get proc
  */
 FmgrInfo *
@@ -309,7 +323,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint)
+HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits)
 {
 	Buffer		buf;
 	Page		page;
@@ -328,6 +342,10 @@ HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entry
 
 	if (dimensions != NULL)
 		*dimensions = metap->dimensions;
+
+	/* Zero for indexes created before the field existed */
+	if (rabitqBits != NULL)
+		*rabitqBits = metap->rabitqBits;
 
 	if (entryPoint != NULL)
 	{
@@ -351,7 +369,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint);
+	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint, NULL);
 
 	return entryPoint;
 }
@@ -550,13 +568,15 @@ static void
 HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
 {
 	Page		page;
+	ItemId		itemid;
 	HnswElementTuple etup;
 
 	/* Read vector */
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
+	itemid = PageGetItemId(page, offno);
+	etup = (HnswElementTuple) PageGetItem(page, itemid);
 
 	Assert(HnswIsElementTuple(etup));
 
@@ -569,7 +589,7 @@ HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery 
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
 		else if (q->rabitq != NULL)
-			*distance = HnswRabitqDistance(q->rabitq, (Pointer) &etup->data);
+			*distance = HnswRabitqDistance(q->rabitq, etup, ItemIdGetLength(itemid));
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}

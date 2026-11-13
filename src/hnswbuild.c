@@ -98,6 +98,7 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->dimensions = buildstate->dimensions;
 	metap->m = buildstate->m;
 	metap->efConstruction = buildstate->efConstruction;
+	metap->rabitqBits = buildstate->rabitqBits;
 	metap->entryBlkno = InvalidBlockNumber;
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
@@ -182,7 +183,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 		memset(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 		/* Calculate sizes */
-		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
+		etupSize = HnswRabitqElementTupleSize(buildstate->rabitq, VARSIZE_ANY(valuePtr));
 		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, buildstate->m);
 		combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 
@@ -193,6 +194,7 @@ CreateGraphPages(HnswBuildState * buildstate)
 					 errmsg("index tuple too large")));
 
 		HnswSetElementTuple(base, etup, element);
+		HnswRabitqSetElementTuple(buildstate->rabitq, etup);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -716,6 +718,20 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
+
+	/* Set up RaBitQ */
+	buildstate->rabitqBits = HnswGetRabitqBits(index);
+	buildstate->rabitq = NULL;
+	if (buildstate->rabitqBits > 0)
+	{
+		buildstate->rabitq = HnswRabitqInit(&buildstate->support, buildstate->dimensions, buildstate->rabitqBits);
+
+		if (HnswRabitqMaxElementTupleSize(buildstate->rabitq) > HNSW_MAX_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("rabitq_bits is too large for %d dimensions", buildstate->dimensions),
+					 errhint("The vector and its code must fit on a single index page.")));
+	}
 
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));
 	buildstate->graph = &buildstate->graphData;
