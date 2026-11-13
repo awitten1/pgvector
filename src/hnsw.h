@@ -75,6 +75,10 @@ typedef Pointer Item;
 /* Tuple types */
 #define HNSW_ELEMENT_TUPLE_TYPE  1
 #define HNSW_NEIGHBOR_TUPLE_TYPE 2
+#define HNSW_CENTROID_TUPLE_TYPE 3
+
+/* Max values of the RaBitQ centroid per page */
+#define HNSW_CENTROID_MAX_VALUES 1024
 
 /* Make graph robust against non-HOT updates */
 #define HNSW_HEAPTIDS 10
@@ -330,6 +334,10 @@ typedef struct HnswBuildState
 	int			rabitqBits;
 	bool		rabitqCodesOnly;
 	HnswRabitq *rabitq;
+	float	   *centroid;		/* NULL for the origin */
+	double	   *centroidSums;
+	int64		centroidSamples;
+	int			centroidBlockSamples;
 
 	/* Statistics */
 	double		indtuples;
@@ -368,6 +376,7 @@ typedef struct HnswMetaPageData
 	BlockNumber insertPage;
 	uint16		rabitqBits;		/* zero for indexes without RaBitQ codes */
 	uint16		rabitqCodesOnly;	/* codes are stored instead of values */
+	BlockNumber centroidBlkno;	/* first RaBitQ centroid page (zero if none) */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -394,6 +403,18 @@ typedef struct HnswElementTupleData
 }			HnswElementTupleData;
 
 typedef HnswElementTupleData * HnswElementTuple;
+
+typedef struct HnswCentroidTupleData
+{
+	uint8		type;
+	uint8		unused;
+	uint16		count;
+	float		values[FLEXIBLE_ARRAY_MEMBER];
+}			HnswCentroidTupleData;
+
+typedef HnswCentroidTupleData * HnswCentroidTuple;
+
+#define HNSW_CENTROID_TUPLE_SIZE(count)	MAXALIGN(offsetof(HnswCentroidTupleData, values) + (count) * sizeof(float))
 
 typedef struct HnswNeighborTupleData
 {
@@ -519,7 +540,10 @@ bool		HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswS
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
-HnswRabitq *HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly);
+HnswRabitq *HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly, Relation index);
+void		HnswRabitqSetCentroid(HnswRabitq * rabitq, const float *centroid);
+void		HnswRabitqAddToSums(HnswRabitq * rabitq, Pointer value, double *sums);
+float	   *HnswLoadCentroid(Relation index, int dimensions);
 Pointer		HnswRabitqFormCode(HnswRabitq * rabitq, Pointer value);
 void		HnswRabitqSetQuery(HnswRabitq * rabitq, Pointer value);
 bool		HnswRabitqHasQuery(HnswRabitq * rabitq);
@@ -528,7 +552,7 @@ Size		HnswRabitqCodeSize(HnswRabitq * rabitq);
 Size		HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize);
 Size		HnswRabitqMaxElementTupleSize(HnswRabitq * rabitq);
 void		HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup);
-HnswRabitq *HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly);
+HnswRabitq *HnswRabitqBeginScan(Relation index, HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly);
 double		HnswRabitqDistance(HnswRabitq * rabitq, HnswElementTuple etup, Size etupSize);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
 void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, Pointer value);

@@ -148,7 +148,7 @@ GetFloats(HnswRabitq * rabitq, Pointer value)
  * context is reset or deleted.
  */
 HnswRabitq *
-HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly)
+HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly, Relation index)
 {
 	HnswRabitq *rabitq;
 	MemoryContextCallback *callback;
@@ -184,7 +184,47 @@ HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly)
 
 	rabitq->codeBytes = rabitq_code_bytes(rabitq->ctx);
 
+	/* Use the centroid from the index */
+	if (index != NULL)
+	{
+		float	   *centroid = HnswLoadCentroid(index, dimensions);
+
+		if (centroid != NULL)
+		{
+			HnswRabitqSetCentroid(rabitq, centroid);
+			pfree(centroid);
+		}
+	}
+
 	return rabitq;
+}
+
+/*
+ * Set the centroid that values are encoded relative to
+ *
+ * Must be called before encoding or setting the query
+ */
+void
+HnswRabitqSetCentroid(HnswRabitq * rabitq, const float *centroid)
+{
+	char		errbuf[256];
+
+	if (rabitq_set_centroid(rabitq->ctx, centroid, errbuf, sizeof(errbuf)) != 0)
+		ReportError("centroid setup", errbuf);
+
+	rabitq->hasQuery = false;
+}
+
+/*
+ * Add a value to sums (for calculating the centroid)
+ */
+void
+HnswRabitqAddToSums(HnswRabitq * rabitq, Pointer value, double *sums)
+{
+	const float *x = GetFloats(rabitq, value);
+
+	for (int i = 0; i < rabitq->dim; i++)
+		sums[i] += x[i];
 }
 
 /*
@@ -345,7 +385,7 @@ HnswRabitqSymmetricDistance(HnswRabitq * rabitq, Pointer a, Pointer b)
  * of the codes stored in the index (zero if none).
  */
 HnswRabitq *
-HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly)
+HnswRabitqBeginScan(Relation index, HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly)
 {
 	HnswRabitq *rabitq;
 	bool		automatic = hnsw_rabitq_bits < 0;
@@ -369,7 +409,7 @@ HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int inde
 					 errmsg("iterative scans are not supported for hnsw indexes with RaBitQ codes without vectors"),
 					 errhint("Set hnsw.iterative_scan = off.")));
 
-		rabitq = HnswRabitqInit(support, dimensions, bits, true);
+		rabitq = HnswRabitqInit(support, dimensions, bits, true, index);
 		rabitq->stored = true;
 		HnswRabitqSetQuery(rabitq, (Pointer) PG_DETOAST_DATUM(value));
 
@@ -391,7 +431,8 @@ HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int inde
 				 errhint("Set hnsw.iterative_scan = off.")));
 	}
 
-	rabitq = HnswRabitqInit(support, dimensions, bits, false);
+	/* The centroid is not needed to quantize on the fly, but is used if present */
+	rabitq = HnswRabitqInit(support, dimensions, bits, false, index);
 
 	/* Quantize on the fly if the index does not have matching codes */
 	rabitq->stored = bits == indexBits;

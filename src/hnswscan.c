@@ -46,7 +46,7 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
 	q->value = value;
-	q->rabitq = HnswRabitqBeginScan(support, value, dimensions, rabitqBits, rabitqCodesOnly);
+	q->rabitq = HnswRabitqBeginScan(index, support, value, dimensions, rabitqBits, rabitqCodesOnly);
 	so->m = m;
 
 	if (entryPoint == NULL)

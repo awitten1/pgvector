@@ -380,6 +380,62 @@ HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entry
 }
 
 /*
+ * Load the RaBitQ centroid from the index
+ *
+ * Returns NULL if the index does not have one (so codes are relative to
+ * the origin)
+ */
+float *
+HnswLoadCentroid(Relation index, int dimensions)
+{
+	Buffer		buf;
+	Page		page;
+	BlockNumber blkno;
+	float	   *centroid;
+	int			loaded = 0;
+
+	buf = ReadBuffer(index, HNSW_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	blkno = HnswPageGetMeta(page)->centroidBlkno;
+	UnlockReleaseBuffer(buf);
+
+	/* Zero for indexes created before the field existed */
+	if (blkno == HNSW_METAPAGE_BLKNO || !BlockNumberIsValid(blkno))
+		return NULL;
+
+	centroid = palloc(mul_size(sizeof(float), dimensions));
+
+	while (BlockNumberIsValid(blkno))
+	{
+		HnswCentroidTuple ctup;
+
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+
+		if (PageGetMaxOffsetNumber(page) != FirstOffsetNumber)
+			elog(ERROR, "hnsw centroid page is not valid");
+
+		ctup = (HnswCentroidTuple) PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+
+		if (ctup->type != HNSW_CENTROID_TUPLE_TYPE || ctup->count > dimensions - loaded)
+			elog(ERROR, "hnsw centroid page is not valid");
+
+		memcpy(centroid + loaded, ctup->values, ctup->count * sizeof(float));
+		loaded += ctup->count;
+
+		blkno = HnswPageGetOpaque(page)->nextblkno;
+		UnlockReleaseBuffer(buf);
+	}
+
+	if (loaded != dimensions)
+		elog(ERROR, "hnsw centroid is not valid");
+
+	return centroid;
+}
+
+/*
  * Get the entry point
  */
 HnswElement

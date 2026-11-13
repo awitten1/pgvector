@@ -32,6 +32,8 @@ struct RabitqContext
 	std::unique_ptr<rabitqlib::Rotator<float>> rotator;
 
 	/* Rotated (and padded) vectors */
+	std::vector<float> rotatedCentroid;
+	bool		hasCentroid = false;
 	std::vector<float> rotatedQuery;
 	std::vector<float> rotatedInput;
 
@@ -114,12 +116,32 @@ MakeCodeView(const RabitqContext * ctx, const uint8_t *code)
 	return view;
 }
 
+/*
+ * Get the rotated centroid (nullptr for the origin)
+ */
+static const float *
+Centroid(const RabitqContext * ctx)
+{
+	return ctx->hasCentroid ? ctx->rotatedCentroid.data() : nullptr;
+}
+
 static void
 Encode(RabitqContext * ctx, const float *input, uint8_t *code, float *factors)
 {
+	const float *centroid = Centroid(ctx);
+	float		normSqr = 0;
+
 	ctx->rotator->rotate(input, ctx->rotatedInput.data());
 
-	api::Factors f = api::encode(ctx->params, ctx->rotatedInput.data(), nullptr,
+	for (size_t i = 0; i < ctx->params.dim; i++)
+	{
+		float		diff = ctx->rotatedInput[i] - (centroid != nullptr ? centroid[i] : 0.0F);
+
+		normSqr += diff * diff;
+	}
+	factors[3] = normSqr;
+
+	api::Factors f = api::encode(ctx->params, ctx->rotatedInput.data(), centroid,
 								 MakeCodeOutput(ctx, code),
 								 api::Buffer{ctx->workspace, ctx->workspaceBytes});
 
@@ -145,10 +167,11 @@ Compute(const RabitqContext * ctx, const uint8_t *code, const float *factors)
 /*
  * Reconstruct a vector from its code for use as a query
  *
- * With a zero centroid, the estimator is add + |q|^2 + rescale * <q, u - cb>
- * for L2 (|o|^2 - 2 <o, q> + |q|^2) and add + rescale * <q, u - cb> for IP
- * (1 - <o, q>), so o is approximated by scale * (u - cb) with scale of
- * -rescale / 2 for L2 and -rescale for IP.
+ * For a vector o with centroid c, the estimator approximates the residual
+ * o - c by scale * (u - cb), with scale of -rescale / 2 for L2 (which
+ * estimates |o - c|^2 + |q - c|^2 - 2 <o - c, q - c>) and -rescale for IP
+ * (which estimates 1 - <o, q>). The rest is in the add factor and the terms
+ * computed from the query. So o is approximated by c + scale * (u - cb).
  */
 static void
 SetSymmetricQuery(RabitqContext * ctx, const uint8_t *code, const float *factors)
@@ -172,6 +195,7 @@ SetSymmetricQuery(RabitqContext * ctx, const uint8_t *code, const float *factors
 	float		cb = (static_cast<float>(1U << ctx->params.total_bits) - 1.0F) / 2.0F;
 	float		scale = ctx->params.metric == rabitqlib::METRIC_L2 ? -factors[1] / 2.0F : -factors[1];
 	float		normSqr = 0;
+	const float *centroid = Centroid(ctx);
 
 	for (size_t i = 0; i < dim; i++)
 	{
@@ -179,11 +203,11 @@ SetSymmetricQuery(RabitqContext * ctx, const uint8_t *code, const float *factors
 		unsigned	u = ctx->symUnpacked[2 * i] | (static_cast<unsigned>(ctx->symUnpacked[2 * i + 1]) << 8);
 		float		v = scale * (static_cast<float>(u) - cb);
 
-		ctx->symQuery[i] = v;
+		ctx->symQuery[i] = (centroid != nullptr ? centroid[i] : 0.0F) + v;
 		normSqr += v * v;
 	}
 
-	ctx->symState = api::prepare_query(ctx->params, ctx->symQuery.data(), nullptr);
+	ctx->symState = api::prepare_query(ctx->params, ctx->symQuery.data(), centroid);
 	ctx->symNormSqr = normSqr;
 	memcpy(ctx->symCode.data(), code, codeBytes);
 	memcpy(ctx->symFactors, factors, sizeof(ctx->symFactors));
@@ -215,6 +239,7 @@ rabitq_create(int dim, int total_bits, RabitqMetric metric, uint32_t seed,
 		ctx->params.metric = metric == RABITQ_METRIC_IP ? rabitqlib::METRIC_IP : rabitqlib::METRIC_L2;
 		ctx->req = api::requirements(ctx->params, kLayout);
 
+		ctx->rotatedCentroid.resize(padded);
 		ctx->rotatedQuery.resize(padded);
 		ctx->rotatedInput.resize(padded);
 		ctx->code.resize(ctx->req.code_bytes + ctx->req.extra_bytes);
@@ -255,12 +280,24 @@ rabitq_code_bytes(const RabitqContext * ctx)
 }
 
 extern "C" int
+rabitq_set_centroid(RabitqContext * ctx, const float *centroid, char *errbuf, size_t errlen)
+{
+	return Guarded(errbuf, errlen, [&] {
+		ctx->hasCentroid = false;
+		ctx->hasQuery = false;
+		ctx->hasSym = false;
+		ctx->rotator->rotate(centroid, ctx->rotatedCentroid.data());
+		ctx->hasCentroid = true;
+	});
+}
+
+extern "C" int
 rabitq_set_query(RabitqContext * ctx, const float *query, char *errbuf, size_t errlen)
 {
 	return Guarded(errbuf, errlen, [&] {
 		ctx->hasQuery = false;
 		ctx->rotator->rotate(query, ctx->rotatedQuery.data());
-		ctx->queryState = api::prepare_query(ctx->params, ctx->rotatedQuery.data(), nullptr);
+		ctx->queryState = api::prepare_query(ctx->params, ctx->rotatedQuery.data(), Centroid(ctx));
 		ctx->hasQuery = true;
 	});
 }
@@ -304,16 +341,28 @@ rabitq_symmetric(RabitqContext * ctx, const uint8_t *code_a,
 		if (ctx->params.metric == rabitqlib::METRIC_L2)
 		{
 			/*
-			 * The reconstruction is longer than the original, so use the
-			 * original squared norm (add) for the query term. Errors of
-			 * similar vectors are correlated, which underestimates their
-			 * distance, so apply the triangle inequality as a lower bound.
+			 * The reconstructed residual is longer than the original, so use
+			 * the original squared distance to the centroid for the query
+			 * term. Errors of similar vectors are correlated, which
+			 * underestimates their distance, so apply the triangle
+			 * inequality (through the centroid) as a lower bound.
 			 */
-			float		normA = std::sqrt(std::max(factors_a[0], 0.0F));
-			float		normB = std::sqrt(std::max(factors_b[0], 0.0F));
+			float		normA = std::sqrt(std::max(factors_a[3], 0.0F));
+			float		normB = std::sqrt(std::max(factors_b[3], 0.0F));
 
-			d = d - ctx->symNormSqr + factors_a[0];
+			d = d - ctx->symNormSqr + factors_a[3];
 			d = std::max(d, (normA - normB) * (normA - normB));
+		}
+		else
+		{
+			/*
+			 * The estimate includes <q, c>, which used the reconstructed
+			 * residual r' in place of the original residual r. The add
+			 * factor is 1 - <r, c> + <r', c>, so this replaces <r', c> with
+			 * the exact <r, c>. No effect when the centroid is the origin
+			 * (add is 1).
+			 */
+			d += factors_a[0] - 1.0F;
 		}
 
 		*distance = d;

@@ -31,8 +31,11 @@ typedef enum RabitqMetric
 	RABITQ_METRIC_IP = 1		/* estimates 1 - inner product */
 }			RabitqMetric;
 
-/* Number of floats in a factors array */
-#define RABITQ_NUM_FACTORS 3
+/*
+ * Number of floats in a factors array: the three factors from the library,
+ * followed by the squared distance to the centroid (for rabitq_symmetric)
+ */
+#define RABITQ_NUM_FACTORS 4
 
 /*
  * Create a context for vectors with dim dimensions (at least 64) quantized
@@ -47,6 +50,14 @@ void		rabitq_free(RabitqContext * ctx);
 
 /* Size of one encoded vector in bytes, excluding factors */
 size_t		rabitq_code_bytes(const RabitqContext * ctx);
+
+/*
+ * Set the centroid that vectors are encoded relative to (dim floats).
+ * Must be called before any other function, and codes are only comparable
+ * when they use the same centroid. The default is the origin.
+ */
+int			rabitq_set_centroid(RabitqContext * ctx, const float *centroid,
+								char *errbuf, size_t errlen);
 
 /* Set the query used by rabitq_compute and rabitq_estimate */
 int			rabitq_set_query(RabitqContext * ctx, const float *query,

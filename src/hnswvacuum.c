@@ -902,7 +902,7 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 
 	/* Values are codes, so the graph is repaired with estimated distances */
 	if (rabitqCodesOnly)
-		vacuumstate->support.codes = HnswRabitqInit(&vacuumstate->support, dimensions, rabitqBits, true);
+		vacuumstate->support.codes = HnswRabitqInit(&vacuumstate->support, dimensions, rabitqBits, true, index);
 
 	/* Create hash table */
 	vacuumstate->deleting = tidhash_create(CurrentMemoryContext, 256, NULL);

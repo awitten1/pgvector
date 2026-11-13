@@ -788,7 +788,7 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 
 	/* Set up RaBitQ to encode the value (freed with the memory context) */
 	if (rabitqBits > 0)
-		rabitq = HnswRabitqInit(support, dimensions, rabitqBits, rabitqCodesOnly);
+		rabitq = HnswRabitqInit(support, dimensions, rabitqBits, rabitqCodesOnly, index);
 
 	if (rabitqCodesOnly)
 	{
