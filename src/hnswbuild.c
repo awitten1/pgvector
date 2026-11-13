@@ -99,6 +99,7 @@ CreateMetaPage(HnswBuildState * buildstate)
 	metap->m = buildstate->m;
 	metap->efConstruction = buildstate->efConstruction;
 	metap->rabitqBits = buildstate->rabitqBits;
+	metap->rabitqCodesOnly = buildstate->rabitqCodesOnly ? 1 : 0;
 	metap->entryBlkno = InvalidBlockNumber;
 	metap->entryOffno = InvalidOffsetNumber;
 	metap->entryLevel = -1;
@@ -176,6 +177,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
 
+		/* Store the code instead of the value */
+		if (buildstate->rabitqCodesOnly)
+			valuePtr = HnswRabitqFormCode(buildstate->rabitq, valuePtr);
+
 		/* Update iterator */
 		iter = element->next;
 
@@ -193,8 +198,11 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
-		HnswSetElementTuple(base, etup, element);
+		HnswSetElementTuple(base, etup, element, valuePtr);
 		HnswRabitqSetElementTuple(buildstate->rabitq, etup);
+
+		if (buildstate->rabitqCodesOnly)
+			pfree(valuePtr);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -536,6 +544,8 @@ InsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer heaptid, Hn
 		{
 			ereport(NOTICE,
 					(errmsg("hnsw graph no longer fits into maintenance_work_mem after " INT64_FORMAT " tuples", (int64) graph->indtuples),
+					 buildstate->rabitqCodesOnly ?
+					 errdetail("Building will take significantly more time, and the rest of the graph will be built with estimated distances.") :
 					 errdetail("Building will take significantly more time."),
 					 errhint("Increase maintenance_work_mem to speed up builds.")));
 
@@ -703,7 +713,11 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("column does not have dimensions")));
 
-	if (buildstate->dimensions > buildstate->typeInfo->maxDimensions)
+	buildstate->rabitqBits = HnswGetRabitqBits(index);
+	buildstate->rabitqCodesOnly = buildstate->rabitqBits > 0 && !HnswGetRabitqKeepVectors(index);
+
+	/* Only codes need to fit on a page (checked below) */
+	if (buildstate->dimensions > buildstate->typeInfo->maxDimensions && !buildstate->rabitqCodesOnly)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("column cannot have more than %d dimensions for hnsw index", buildstate->typeInfo->maxDimensions)));
@@ -720,17 +734,16 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 	HnswInitSupport(&buildstate->support, index);
 
 	/* Set up RaBitQ */
-	buildstate->rabitqBits = HnswGetRabitqBits(index);
 	buildstate->rabitq = NULL;
 	if (buildstate->rabitqBits > 0)
 	{
-		buildstate->rabitq = HnswRabitqInit(&buildstate->support, buildstate->dimensions, buildstate->rabitqBits);
+		buildstate->rabitq = HnswRabitqInit(&buildstate->support, buildstate->dimensions, buildstate->rabitqBits, buildstate->rabitqCodesOnly);
 
 		if (HnswRabitqMaxElementTupleSize(buildstate->rabitq) > HNSW_MAX_SIZE)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("rabitq_bits is too large for %d dimensions", buildstate->dimensions),
-					 errhint("The vector and its code must fit on a single index page.")));
+					 errhint("Each element must fit on a single index page.")));
 	}
 
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));

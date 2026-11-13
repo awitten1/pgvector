@@ -33,19 +33,20 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	int			m;
 	int			dimensions;
 	int			rabitqBits;
+	bool		rabitqCodesOnly;
 	HnswElement entryPoint;
 	char	   *base = NULL;
 	HnswQuery  *q = &so->q;
 
 	/* Get m, dimensions, and entry point */
-	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits);
+	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits, &rabitqCodesOnly);
 
 	/* Check dimensions match index */
 	if (DatumGetPointer(value) != NULL)
 		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
 	q->value = value;
-	q->rabitq = HnswRabitqBeginScan(support, value, dimensions, rabitqBits);
+	q->rabitq = HnswRabitqBeginScan(support, value, dimensions, rabitqBits, rabitqCodesOnly);
 	so->m = m;
 
 	if (entryPoint == NULL)

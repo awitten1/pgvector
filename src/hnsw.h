@@ -167,6 +167,7 @@ typedef enum HnswIterativeScanMode
 
 typedef struct HnswElementData HnswElementData;
 typedef struct HnswNeighborArray HnswNeighborArray;
+typedef struct HnswRabitq HnswRabitq;
 
 #define HnswPtrDeclare(type, relptrtype, ptrtype) \
 	relptr_declare(type, relptrtype); \
@@ -228,6 +229,7 @@ typedef struct HnswOptions
 	int			m;				/* number of connections */
 	int			efConstruction; /* size of dynamic candidate list */
 	int			rabitqBits;		/* bits per dimension for RaBitQ codes */
+	bool		rabitqKeepVectors;	/* store vectors as well as codes */
 }			HnswOptions;
 
 typedef struct HnswGraph
@@ -303,9 +305,8 @@ typedef struct HnswSupport
 	FmgrInfo   *procinfo;
 	FmgrInfo   *normprocinfo;
 	Oid			collation;
+	HnswRabitq *codes;			/* not NULL if values are RaBitQ codes */
 }			HnswSupport;
-
-typedef struct HnswRabitq HnswRabitq;
 
 typedef struct HnswQuery
 {
@@ -327,6 +328,7 @@ typedef struct HnswBuildState
 	int			m;
 	int			efConstruction;
 	int			rabitqBits;
+	bool		rabitqCodesOnly;
 	HnswRabitq *rabitq;
 
 	/* Statistics */
@@ -365,6 +367,7 @@ typedef struct HnswMetaPageData
 	int16		entryLevel;
 	BlockNumber insertPage;
 	uint16		rabitqBits;		/* zero for indexes without RaBitQ codes */
+	uint16		rabitqCodesOnly;	/* codes are stored instead of values */
 }			HnswMetaPageData;
 
 typedef HnswMetaPageData * HnswMetaPage;
@@ -489,6 +492,7 @@ typedef struct HnswVacuumState
 int			HnswGetM(Relation index);
 int			HnswGetEfConstruction(Relation index);
 int			HnswGetRabitqBits(Relation index);
+bool		HnswGetRabitqKeepVectors(Relation index);
 FmgrInfo   *HnswOptionalProcInfo(Relation index, uint16 procnum);
 void		HnswInitSupport(HnswSupport * support, Relation index);
 Datum		HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value);
@@ -500,7 +504,7 @@ void		HnswInitSearchState(HnswSearchState * searchState, Relation index, bool ma
 void		HnswEndSearchState(HnswSearchState * searchState);
 List	   *HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples, HnswSearchState * searchState);
 HnswElement HnswGetEntryPoint(Relation index);
-void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits);
+void		HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits, bool *rabitqCodesOnly);
 void	   *HnswAlloc(HnswAllocator * allocator, Size size);
 HnswElement HnswInitElement(char *base, ItemPointer tid, int m, double ml, int maxLevel, HnswAllocator * alloc);
 HnswElement HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno);
@@ -515,15 +519,19 @@ bool		HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswS
 void		HnswUpdateNeighborsOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, bool building);
 void		HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHeaptids, bool loadVec);
 void		HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance);
-HnswRabitq *HnswRabitqInit(HnswSupport * support, int dimensions, int bits);
+HnswRabitq *HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly);
+Pointer		HnswRabitqFormCode(HnswRabitq * rabitq, Pointer value);
+void		HnswRabitqSetQuery(HnswRabitq * rabitq, Pointer value);
+bool		HnswRabitqHasQuery(HnswRabitq * rabitq);
+double		HnswRabitqSymmetricDistance(HnswRabitq * rabitq, Pointer a, Pointer b);
 Size		HnswRabitqCodeSize(HnswRabitq * rabitq);
 Size		HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize);
 Size		HnswRabitqMaxElementTupleSize(HnswRabitq * rabitq);
 void		HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup);
-HnswRabitq *HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits);
+HnswRabitq *HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly);
 double		HnswRabitqDistance(HnswRabitq * rabitq, HnswElementTuple etup, Size etupSize);
 bool		HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support);
-void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element);
+void		HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, Pointer value);
 void		HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support);
 bool		HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc);
 void		HnswInitLockTranche(void);

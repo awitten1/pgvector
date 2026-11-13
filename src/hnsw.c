@@ -102,6 +102,8 @@ HnswInit(void)
 	/* Experimental */
 	add_int_reloption(hnsw_relopt_kind, "rabitq_bits", "Bits per dimension for RaBitQ codes (0 to disable)",
 					  0, 0, 9, AccessExclusiveLock);
+	add_bool_reloption(hnsw_relopt_kind, "rabitq_keep_vectors", "Store vectors as well as RaBitQ codes",
+					   false, AccessExclusiveLock);
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -186,7 +188,7 @@ hnswcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		Relation	index;
 
 		index = index_open(indexInfo->indexoid, NoLock);
-		HnswGetMetaPageInfo(index, &m, NULL, NULL, NULL);
+		HnswGetMetaPageInfo(index, &m, NULL, NULL, NULL, NULL);
 		index_close(index, NoLock);
 	}
 	else
@@ -267,6 +269,7 @@ hnswoptions(Datum reloptions, bool validate)
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
 		{"rabitq_bits", RELOPT_TYPE_INT, offsetof(HnswOptions, rabitqBits)},
+		{"rabitq_keep_vectors", RELOPT_TYPE_BOOL, offsetof(HnswOptions, rabitqKeepVectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

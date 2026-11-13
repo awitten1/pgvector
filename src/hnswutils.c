@@ -157,6 +157,20 @@ HnswGetRabitqBits(Relation index)
 }
 
 /*
+ * Get whether to store vectors as well as RaBitQ codes
+ */
+bool
+HnswGetRabitqKeepVectors(Relation index)
+{
+	HnswOptions *opts = (HnswOptions *) index->rd_options;
+
+	if (opts)
+		return opts->rabitqKeepVectors;
+
+	return false;
+}
+
+/*
  * Get proc
  */
 FmgrInfo *
@@ -177,6 +191,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+	support->codes = NULL;
 }
 
 /*
@@ -323,7 +338,7 @@ HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
  * Get the metapage info
  */
 void
-HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits)
+HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entryPoint, int *rabitqBits, bool *rabitqCodesOnly)
 {
 	Buffer		buf;
 	Page		page;
@@ -347,6 +362,9 @@ HnswGetMetaPageInfo(Relation index, int *m, int *dimensions, HnswElement * entry
 	if (rabitqBits != NULL)
 		*rabitqBits = metap->rabitqBits;
 
+	if (rabitqCodesOnly != NULL)
+		*rabitqCodesOnly = metap->rabitqCodesOnly != 0;
+
 	if (entryPoint != NULL)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
@@ -369,7 +387,7 @@ HnswGetEntryPoint(Relation index)
 {
 	HnswElement entryPoint;
 
-	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint, NULL);
+	HnswGetMetaPageInfo(index, NULL, NULL, &entryPoint, NULL, NULL);
 
 	return entryPoint;
 }
@@ -463,11 +481,13 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
 
 /*
  * Set element tuple, except for neighbor info
+ *
+ * Uses the value of the element if value is NULL
  */
 void
-HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
+HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, Pointer value)
 {
-	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	Pointer		valuePtr = value != NULL ? value : HnswPtrAccess(base, element->value);
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -558,6 +578,10 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
+	/* Values are codes, so estimate the distance */
+	if (support->codes != NULL)
+		return HnswRabitqSymmetricDistance(support->codes, DatumGetPointer(a), DatumGetPointer(b));
+
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
@@ -1510,7 +1534,15 @@ HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint
 	HnswInitSearchState(&searchState, index, maintenance);
 
 	q.value = HnswGetValue(base, element);
-	q.rabitq = NULL;
+
+	/*
+	 * When values are codes, use the original value of a new element to
+	 * search (if available), which is more accurate than its code
+	 */
+	if (!existing && support->codes != NULL && HnswRabitqHasQuery(support->codes))
+		q.rabitq = support->codes;
+	else
+		q.rabitq = NULL;
 
 	/* Precompute hash */
 	if (inMemory)

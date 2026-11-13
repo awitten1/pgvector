@@ -14,13 +14,23 @@
 /*
  * Experimental: estimate distances during HNSW scans with RaBitQ.
  *
- * Indexes created with the rabitq_bits option store a code for each element
- * after its value in the element tuple (stage 1b). Scans estimate distances
- * from the stored codes, and the executor reranks with exact distances (see
- * hnswgettuple). Builds, inserts, and vacuum still use exact distances.
+ * Indexes created with the rabitq_bits option store a code for each element.
+ * Scans estimate distances from the stored codes, and the executor reranks
+ * with exact distances from the heap (see hnswgettuple).
  *
- * Scans can also quantize values on the fly (stage 1a), which works with any
- * index but is slow. This is only useful for measuring recall.
+ * By default, the code is stored instead of the value (as a varlena with the
+ * factors followed by the code), so the index does not contain the original
+ * vectors. In-memory builds still use exact distances, but inserts, vacuum,
+ * and the on-disk phase of builds only have codes for existing elements, so
+ * they use estimated distances: asymmetric ones (value vs code) to search
+ * for the neighbors of a new element, and symmetric ones (code vs code)
+ * between existing elements.
+ *
+ * With rabitq_keep_vectors, the code is stored after the value instead, and
+ * builds, inserts, and vacuum use exact distances.
+ *
+ * Scans of indexes with vectors can also quantize values on the fly, which
+ * is slow and only useful for measuring recall.
  */
 
 /* Fixed so codes and queries always use the same rotation */
@@ -36,6 +46,8 @@ struct HnswRabitq
 	RabitqContext *ctx;
 	bool		isHalf;
 	bool		stored;			/* use codes stored in the index */
+	bool		codesOnly;		/* codes are stored instead of values */
+	bool		hasQuery;
 	int			dim;
 	Size		codeBytes;		/* excluding factors */
 	float	   *buf;			/* for converting halfvec to float */
@@ -136,7 +148,7 @@ GetFloats(HnswRabitq * rabitq, Pointer value)
  * context is reset or deleted.
  */
 HnswRabitq *
-HnswRabitqInit(HnswSupport * support, int dimensions, int bits)
+HnswRabitqInit(HnswSupport * support, int dimensions, int bits, bool codesOnly)
 {
 	HnswRabitq *rabitq;
 	MemoryContextCallback *callback;
@@ -156,6 +168,7 @@ HnswRabitqInit(HnswSupport * support, int dimensions, int bits)
 
 	rabitq = palloc0_object(HnswRabitq);
 	rabitq->isHalf = isHalf;
+	rabitq->codesOnly = codesOnly;
 	rabitq->dim = dimensions;
 	if (isHalf)
 		rabitq->buf = palloc(mul_size(sizeof(float), dimensions));
@@ -175,6 +188,21 @@ HnswRabitqInit(HnswSupport * support, int dimensions, int bits)
 }
 
 /*
+ * Encode a value
+ */
+static void
+Encode(HnswRabitq * rabitq, Pointer value, char *dst)
+{
+	float		factors[RABITQ_NUM_FACTORS];
+	char		errbuf[256];
+
+	if (rabitq_encode(rabitq->ctx, GetFloats(rabitq, value), (uint8_t *) dst + HNSW_RABITQ_FACTORS_SIZE, factors, errbuf, sizeof(errbuf)) != 0)
+		ReportError("encoding", errbuf);
+
+	memcpy(dst, factors, HNSW_RABITQ_FACTORS_SIZE);
+}
+
+/*
  * Get the size of the factors and code stored for each element
  */
 Size
@@ -189,7 +217,8 @@ HnswRabitqCodeSize(HnswRabitq * rabitq)
 Size
 HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize)
 {
-	if (rabitq == NULL)
+	/* The value is the code if codes only */
+	if (rabitq == NULL || rabitq->codesOnly)
 		return HNSW_ELEMENT_TUPLE_SIZE(valueSize);
 
 	return HNSW_ELEMENT_TUPLE_CODE_SIZE(valueSize, HnswRabitqCodeSize(rabitq));
@@ -201,7 +230,12 @@ HnswRabitqElementTupleSize(HnswRabitq * rabitq, Size valueSize)
 Size
 HnswRabitqMaxElementTupleSize(HnswRabitq * rabitq)
 {
-	Size		valueSize = rabitq->isHalf ? HALFVEC_SIZE(rabitq->dim) : VECTOR_SIZE(rabitq->dim);
+	Size		valueSize;
+
+	if (rabitq->codesOnly)
+		valueSize = add_size(VARHDRSZ, HnswRabitqCodeSize(rabitq));
+	else
+		valueSize = rabitq->isHalf ? HALFVEC_SIZE(rabitq->dim) : VECTOR_SIZE(rabitq->dim);
 
 	return HnswRabitqElementTupleSize(rabitq, valueSize);
 }
@@ -224,19 +258,84 @@ GetStoredCode(HnswElementTuple etup)
 void
 HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup)
 {
-	char	   *dst;
-	float		factors[RABITQ_NUM_FACTORS];
-	char		errbuf[256];
-
-	if (rabitq == NULL)
+	/* The value is the code if codes only */
+	if (rabitq == NULL || rabitq->codesOnly)
 		return;
 
-	dst = GetStoredCode(etup);
+	Encode(rabitq, (Pointer) &etup->data, GetStoredCode(etup));
+}
 
-	if (rabitq_encode(rabitq->ctx, GetFloats(rabitq, (Pointer) &etup->data), (uint8_t *) dst + HNSW_RABITQ_FACTORS_SIZE, factors, errbuf, sizeof(errbuf)) != 0)
-		ReportError("encoding", errbuf);
+/*
+ * Form the code for a value as a varlena, which is stored instead of the
+ * value if codes only
+ */
+Pointer
+HnswRabitqFormCode(HnswRabitq * rabitq, Pointer value)
+{
+	Size		size = add_size(VARHDRSZ, HnswRabitqCodeSize(rabitq));
+	Pointer		result = palloc0(size);
 
-	memcpy(dst, factors, HNSW_RABITQ_FACTORS_SIZE);
+	SET_VARSIZE(result, size);
+	Encode(rabitq, value, VARDATA(result));
+
+	return result;
+}
+
+/*
+ * Get the factors and code from a varlena
+ */
+static char *
+GetCode(HnswRabitq * rabitq, Pointer value)
+{
+	/* Safety check */
+	if (VARSIZE_ANY_EXHDR(value) != HnswRabitqCodeSize(rabitq))
+		elog(ERROR, "hnsw element does not have a RaBitQ code");
+
+	return VARDATA_ANY(value);
+}
+
+/*
+ * Set the query from a value
+ */
+void
+HnswRabitqSetQuery(HnswRabitq * rabitq, Pointer value)
+{
+	char		errbuf[256];
+
+	if (rabitq_set_query(rabitq->ctx, GetFloats(rabitq, value), errbuf, sizeof(errbuf)) != 0)
+		ReportError("query preparation", errbuf);
+
+	rabitq->hasQuery = true;
+}
+
+bool
+HnswRabitqHasQuery(HnswRabitq * rabitq)
+{
+	return rabitq->hasQuery;
+}
+
+/*
+ * Estimate the distance between two codes
+ */
+double
+HnswRabitqSymmetricDistance(HnswRabitq * rabitq, Pointer a, Pointer b)
+{
+	char	   *srcA = GetCode(rabitq, a);
+	char	   *srcB = GetCode(rabitq, b);
+	float		factorsA[RABITQ_NUM_FACTORS];
+	float		factorsB[RABITQ_NUM_FACTORS];
+	float		distance;
+	char		errbuf[256];
+
+	memcpy(factorsA, srcA, HNSW_RABITQ_FACTORS_SIZE);
+	memcpy(factorsB, srcB, HNSW_RABITQ_FACTORS_SIZE);
+
+	if (rabitq_symmetric(rabitq->ctx, (const uint8_t *) srcA + HNSW_RABITQ_FACTORS_SIZE, factorsA,
+						 (const uint8_t *) srcB + HNSW_RABITQ_FACTORS_SIZE, factorsB,
+						 &distance, errbuf, sizeof(errbuf)) != 0)
+		ReportError("estimation", errbuf);
+
+	return distance;
 }
 
 /*
@@ -246,14 +345,38 @@ HnswRabitqSetElementTuple(HnswRabitq * rabitq, HnswElementTuple etup)
  * of the codes stored in the index (zero if none).
  */
 HnswRabitq *
-HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits)
+HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int indexBits, bool codesOnly)
 {
 	HnswRabitq *rabitq;
 	bool		automatic = hnsw_rabitq_bits < 0;
 	int			bits = automatic ? indexBits : hnsw_rabitq_bits;
-	char		errbuf[256];
 
-	if (bits == 0 || DatumGetPointer(value) == NULL)
+	if (DatumGetPointer(value) == NULL)
+		return NULL;
+
+	if (codesOnly)
+	{
+		/* The index does not have values for other distances */
+		if (bits != indexBits)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("index only supports hnsw.rabitq_bits = %d", indexBits),
+					 errhint("The index stores RaBitQ codes without vectors.")));
+
+		if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("iterative scans are not supported for hnsw indexes with RaBitQ codes without vectors"),
+					 errhint("Set hnsw.iterative_scan = off.")));
+
+		rabitq = HnswRabitqInit(support, dimensions, bits, true);
+		rabitq->stored = true;
+		HnswRabitqSetQuery(rabitq, (Pointer) PG_DETOAST_DATUM(value));
+
+		return rabitq;
+	}
+
+	if (bits == 0)
 		return NULL;
 
 	if (hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
@@ -268,13 +391,12 @@ HnswRabitqBeginScan(HnswSupport * support, Datum value, int dimensions, int inde
 				 errhint("Set hnsw.iterative_scan = off.")));
 	}
 
-	rabitq = HnswRabitqInit(support, dimensions, bits);
+	rabitq = HnswRabitqInit(support, dimensions, bits, false);
 
 	/* Quantize on the fly if the index does not have matching codes */
 	rabitq->stored = bits == indexBits;
 
-	if (rabitq_set_query(rabitq->ctx, GetFloats(rabitq, (Pointer) PG_DETOAST_DATUM(value)), errbuf, sizeof(errbuf)) != 0)
-		ReportError("query preparation", errbuf);
+	HnswRabitqSetQuery(rabitq, (Pointer) PG_DETOAST_DATUM(value));
 
 	return rabitq;
 }
@@ -292,7 +414,17 @@ HnswRabitqDistance(HnswRabitq * rabitq, HnswElementTuple etup, Size etupSize)
 	float		distance;
 	char		errbuf[256];
 
-	if (rabitq->stored)
+	if (rabitq->codesOnly)
+	{
+		char	   *src = GetCode(rabitq, (Pointer) &etup->data);
+		float		factors[RABITQ_NUM_FACTORS];
+
+		memcpy(factors, src, HNSW_RABITQ_FACTORS_SIZE);
+
+		if (rabitq_compute(rabitq->ctx, (const uint8_t *) src + HNSW_RABITQ_FACTORS_SIZE, factors, &distance, errbuf, sizeof(errbuf)) != 0)
+			ReportError("estimation", errbuf);
+	}
+	else if (rabitq->stored)
 	{
 		Size		valueSize = VARSIZE_ANY(&etup->data);
 		char	   *src = GetStoredCode(etup);

@@ -61,6 +61,17 @@ int			rabitq_compute(const RabitqContext * ctx, const uint8_t *code,
 						   const float factors[RABITQ_NUM_FACTORS], float *distance,
 						   char *errbuf, size_t errlen);
 
+/*
+ * Estimate the distance between two encoded vectors. The first is
+ * reconstructed from its code and used as the query for the second, so the
+ * estimate is less accurate than rabitq_compute.
+ */
+int			rabitq_symmetric(RabitqContext * ctx, const uint8_t *code_a,
+							 const float factors_a[RABITQ_NUM_FACTORS],
+							 const uint8_t *code_b,
+							 const float factors_b[RABITQ_NUM_FACTORS],
+							 float *distance, char *errbuf, size_t errlen);
+
 /* Encode input and estimate its distance to the query in one step */
 int			rabitq_estimate(RabitqContext * ctx, const float *input, float *distance,
 							char *errbuf, size_t errlen);

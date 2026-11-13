@@ -182,7 +182,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInser
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
-	HnswSetElementTuple(base, etup, e);
+	HnswSetElementTuple(base, etup, e, NULL);
 	HnswRabitqSetElementTuple(rabitq, etup);
 
 	/* Prepare neighbor tuple */
@@ -767,7 +767,9 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 	int			efConstruction = HnswGetEfConstruction(index);
 	int			dimensions;
 	int			rabitqBits;
+	bool		rabitqCodesOnly;
 	HnswRabitq *rabitq = NULL;
+	HnswSupport codeSupport;
 	LOCKMODE	lockmode = ShareLock;
 	char	   *base = NULL;
 
@@ -779,14 +781,28 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 	LockPage(index, HNSW_UPDATE_LOCK, lockmode);
 
 	/* Get m, dimensions, and entry point */
-	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits);
+	HnswGetMetaPageInfo(index, &m, &dimensions, &entryPoint, &rabitqBits, &rabitqCodesOnly);
 
 	/* Check dimensions match index */
 	HnswCheckDim(dimensions, typeInfo, support->collation, value);
 
 	/* Set up RaBitQ to encode the value (freed with the memory context) */
 	if (rabitqBits > 0)
-		rabitq = HnswRabitqInit(support, dimensions, rabitqBits);
+		rabitq = HnswRabitqInit(support, dimensions, rabitqBits, rabitqCodesOnly);
+
+	if (rabitqCodesOnly)
+	{
+		Pointer		original = DatumGetPointer(value);
+
+		/* Elements in the index are compared using their codes */
+		codeSupport = *support;
+		codeSupport.codes = rabitq;
+		support = &codeSupport;
+
+		/* Search with the original value, but store its code */
+		HnswRabitqSetQuery(rabitq, original);
+		value = PointerGetDatum(HnswRabitqFormCode(rabitq, original));
+	}
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);

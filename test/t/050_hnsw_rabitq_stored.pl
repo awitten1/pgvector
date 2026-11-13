@@ -4,7 +4,8 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Experimental RaBitQ codes stored in HNSW indexes (rabitq_bits index option)
+# Experimental RaBitQ codes stored with vectors in HNSW indexes
+# (rabitq_bits and rabitq_keep_vectors index options)
 # Recall thresholds are set below values measured with 50 queries on this data
 
 my $node;
@@ -115,7 +116,7 @@ for my $type ("vector", "halfvec")
 
 		get_expected($operator);
 
-		$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v $opclass) WITH (rabitq_bits = 2);");
+		$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v $opclass) WITH (rabitq_bits = 2, rabitq_keep_vectors = true);");
 
 		# Stored codes are used by default (measured about 0.91-0.94 and 0.98)
 		test_recall(0.80, $operator, -1, 100, "$type stored");
@@ -136,7 +137,7 @@ $node->safe_psql("postgres", "ALTER TABLE tst ALTER COLUMN v TYPE vector($dim);"
 
 # Codes take space
 $node->safe_psql("postgres", "CREATE INDEX plain ON tst USING hnsw (v vector_l2_ops);");
-$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 8);");
+$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 8, rabitq_keep_vectors = true);");
 my $plain_size = $node->safe_psql("postgres", "SELECT pg_relation_size('plain');");
 my $size = $node->safe_psql("postgres", "SELECT pg_relation_size('idx');");
 cmp_ok($size, ">", $plain_size, "index with codes is larger");
@@ -146,7 +147,7 @@ $node->safe_psql("postgres", "DROP INDEX idx;");
 # Inserts
 $node->safe_psql("postgres", "CREATE TABLE tst2 AS SELECT * FROM tst;");
 $node->safe_psql("postgres", "TRUNCATE tst;");
-$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2);");
+$node->safe_psql("postgres", "CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2, rabitq_keep_vectors = true);");
 $node->safe_psql("postgres", "INSERT INTO tst SELECT * FROM tst2;");
 get_expected("<->");
 test_recall(0.80, "<->", -1, 100, "inserts");
@@ -164,7 +165,7 @@ my ($ret, $stdout, $stderr) = $node->psql("postgres", qq(
 	ALTER TABLE tst SET (parallel_workers = 2);
 	SET client_min_messages = DEBUG;
 	SET maintenance_work_mem = '2MB';
-	CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2);
+	CREATE INDEX idx ON tst USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2, rabitq_keep_vectors = true);
 	ALTER TABLE tst RESET (parallel_workers);
 ));
 is($ret, 0, $stderr);
@@ -189,18 +190,18 @@ is($count, 50, "iterative scan");
 $node->safe_psql("postgres", "DROP INDEX idx;");
 
 # Unsupported configurations
-($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON tst USING hnsw (v vector_l1_ops) WITH (rabitq_bits = 2);");
+($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON tst USING hnsw (v vector_l1_ops) WITH (rabitq_bits = 2, rabitq_keep_vectors = true);");
 like($stderr, qr/RaBitQ only supports/);
 
 $node->safe_psql("postgres", "CREATE TABLE small (v vector(3));");
-($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON small USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2);");
+($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON small USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 2, rabitq_keep_vectors = true);");
 like($stderr, qr/RaBitQ requires at least 64 dimensions/);
 
 $node->safe_psql("postgres", "CREATE TABLE big (v vector(2000));");
-($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON big USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 4);");
+($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON big USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 4, rabitq_keep_vectors = true);");
 like($stderr, qr/rabitq_bits is too large for 2000 dimensions/);
 
-($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON big USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 10);");
+($ret, $stdout, $stderr) = $node->psql("postgres", "CREATE INDEX ON big USING hnsw (v vector_l2_ops) WITH (rabitq_bits = 10, rabitq_keep_vectors = true);");
 like($stderr, qr/value 10 out of bounds for option "rabitq_bits"/);
 
 done_testing();
