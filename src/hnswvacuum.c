@@ -735,6 +735,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	Relation	index = vacuumstate->index;
 	BufferAccessStrategy bas = vacuumstate->bas;
 	bool		useFsm = HnswGetTypeInfo(index)->useFsm;
+	BlockNumber rerankFreePage = InvalidBlockNumber;
 
 	/* Wait for iterative scan batch to complete */
 	LockPage(index, HNSW_SCAN_LOCK, ExclusiveLock);
@@ -770,6 +771,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			HnswElementTuple etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 			HnswNeighborTuple ntup;
 			Buffer		nbuf;
+			Buffer		rbuf;
 			Page		npage;
 			BlockNumber neighborPage;
 			OffsetNumber neighborOffno;
@@ -810,6 +812,37 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 			ntup = (HnswNeighborTuple) PageGetItem(npage, PageGetItemId(npage, neighborOffno));
 
+			/* Mark the re-rank tuple of a quantized element as deleted */
+			/* Graph pages are locked before re-rank pages */
+			rbuf = InvalidBuffer;
+			if (HnswTqMarker(&etup->data) == HNSW_TQ_CODE_MARKER)
+			{
+				HnswTqCode *code = (HnswTqCode *) &etup->data;
+
+				if (ItemPointerIsValid(&code->reranktid))
+				{
+					BlockNumber rblkno = ItemPointerGetBlockNumber(&code->reranktid);
+					Page		rpage;
+					ItemId		ritemid;
+					HnswRerankTuple rtup;
+
+					rbuf = ReadBufferExtended(index, MAIN_FORKNUM, rblkno, RBM_NORMAL, bas);
+					LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
+					rpage = GenericXLogRegisterBuffer(state, rbuf, 0);
+					ritemid = PageGetItemId(rpage, ItemPointerGetOffsetNumber(&code->reranktid));
+					rtup = (HnswRerankTuple) PageGetItem(rpage, ritemid);
+
+					if (HnswIsRerankTuple(rtup))
+					{
+						rtup->deleted = 1;
+						memset(rtup->data, 0, ItemIdGetLength(ritemid) - offsetof(HnswRerankTupleData, data));
+					}
+
+					if (!BlockNumberIsValid(rerankFreePage) || rblkno < rerankFreePage)
+						rerankFreePage = rblkno;
+				}
+			}
+
 			/* Overwrite element */
 			/* Use memset instead of MemSet to keep clang-tidy happy */
 			etup->deleted = 1;
@@ -836,6 +869,8 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			GenericXLogFinish(state);
 			if (nbuf != buf)
 				UnlockReleaseBuffer(nbuf);
+			if (BufferIsValid(rbuf))
+				UnlockReleaseBuffer(rbuf);
 
 			/* Set to first free page */
 			if (!useFsm && !BlockNumberIsValid(insertPage))
@@ -867,6 +902,10 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 	/* Update insert page last, after everything has been marked as deleted */
 	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
+
+	/* Allow re-rank slots to be reused */
+	if (BlockNumberIsValid(rerankFreePage))
+		HnswTqLowerRerankInsertPage(index, rerankFreePage);
 }
 
 /*

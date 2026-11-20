@@ -108,6 +108,10 @@ CreateMetaPage(HnswBuildState * buildstate)
 	((PageHeader) page)->pd_lower =
 		((char *) metap + sizeof(HnswMetaPageData)) - (char *) page;
 
+	/* Experimental quantization */
+	if (buildstate->support.tq != NULL)
+		HnswTqSetMetaPage(metap, buildstate->support.tq, page);
+
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
 }
@@ -157,6 +161,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 	Page		page;
 	HnswElementPtr iter = buildstate->graph->head;
 	char	   *base = buildstate->hnswarea;
+	HnswTqState *tq = buildstate->support.tq;
+	Buffer		rbuf = InvalidBuffer;
+	Page		rpage = NULL;
+	BlockNumber rerankHead = InvalidBlockNumber;
 
 	/* Calculate sizes */
 	maxSize = HNSW_MAX_SIZE;
@@ -177,12 +185,55 @@ CreateGraphPages(HnswBuildState * buildstate)
 		Size		ntupSize;
 		Size		combinedSize;
 		Pointer		valuePtr = HnswPtrAccess(base, element->value);
+		HnswTqCode *code = NULL;
 
 		/* Update iterator */
 		iter = element->next;
 
 		/* Zero memory for each element */
 		memset(etup, 0, HNSW_TUPLE_ALLOC_SIZE);
+
+		/*
+		 * For quantized indexes, store the 4-bit code as the value and the
+		 * re-rank payload on a separate chain of pages. The re-rank tuple is
+		 * added before the element so that a neighbor tuple that does not fit
+		 * on the element page is still on the next block.
+		 */
+		if (tq != NULL)
+		{
+			HnswRerankTuple rtup;
+			Size		rtupSize;
+
+			code = HnswTqEncode(tq, PointerGetDatum(valuePtr), &rtup, &rtupSize);
+
+			if (rtup != NULL)
+			{
+				OffsetNumber roffno;
+
+				if (!BufferIsValid(rbuf))
+				{
+					rbuf = HnswNewBuffer(index, forkNum);
+					rpage = BufferGetPage(rbuf);
+					HnswInitPage(rbuf, rpage);
+					HnswPageGetOpaque(rpage)->unused = HNSW_PAGE_RERANK;
+					rerankHead = BufferGetBlockNumber(rbuf);
+				}
+				else if (PageGetFreeSpace(rpage) < rtupSize)
+				{
+					HnswBuildAppendPage(index, &rbuf, &rpage, forkNum);
+					HnswPageGetOpaque(rpage)->unused = HNSW_PAGE_RERANK;
+				}
+
+				roffno = PageAddItem(rpage, (Item) rtup, rtupSize, InvalidOffsetNumber, false, false);
+				if (roffno == InvalidOffsetNumber)
+					elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+
+				ItemPointerSet(&code->reranktid, BufferGetBlockNumber(rbuf), roffno);
+				pfree(rtup);
+			}
+
+			valuePtr = (Pointer) code;
+		}
 
 		/* Calculate sizes */
 		etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
@@ -195,7 +246,10 @@ CreateGraphPages(HnswBuildState * buildstate)
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("index tuple too large")));
 
-		HnswSetElementTuple(base, etup, element);
+		HnswSetElementTuple(base, etup, element, valuePtr);
+
+		if (code != NULL)
+			pfree(code);
 
 		/* Keep element and neighbors on the same page if possible */
 		if (PageGetFreeSpace(page) < etupSize || (combinedSize <= maxSize && PageGetFreeSpace(page) < combinedSize))
@@ -238,6 +292,17 @@ CreateGraphPages(HnswBuildState * buildstate)
 
 	entryPoint = HnswPtrAccess(base, buildstate->graph->entryPoint);
 	HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, entryPoint, insertPage, forkNum, true);
+
+	/* Finish re-rank chain */
+	if (BufferIsValid(rbuf))
+	{
+		BlockNumber rerankInsertPage = BufferGetBlockNumber(rbuf);
+
+		MarkBufferDirty(rbuf);
+		UnlockReleaseBuffer(rbuf);
+
+		HnswTqUpdateRerankMeta(index, rerankHead, rerankInsertPage, forkNum, true);
+	}
 
 	pfree(etup);
 	pfree(ntup);
@@ -719,6 +784,16 @@ InitBuildState(HnswBuildState * buildstate, Relation heap, Relation index, Index
 
 	/* Get support functions */
 	HnswInitSupport(&buildstate->support, index);
+
+	/*
+	 * Experimental quantization (derived from options, not the metapage,
+	 * which does not exist yet). The rotation is deterministic, so parallel
+	 * workers derive the same state.
+	 */
+	if (HnswGetQuantizer(index) != HNSW_QUANTIZER_NONE)
+		buildstate->support.tq = HnswTqCreateState(index, &buildstate->support, buildstate->dimensions);
+	else
+		buildstate->support.tq = NULL;
 
 	InitGraph(&buildstate->graphData, NULL, mul_size(maintenance_work_mem, 1024));
 	buildstate->graph = &buildstate->graphData;

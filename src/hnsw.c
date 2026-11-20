@@ -34,6 +34,20 @@
 #include "catalog/pg_opfamily.h"
 #endif
 
+static relopt_enum_elt_def hnsw_quantizer_options[] = {
+	{"none", HNSW_QUANTIZER_NONE},
+	{"tq4", HNSW_QUANTIZER_TQ4},
+	{(const char *) NULL}
+};
+
+static relopt_enum_elt_def hnsw_rerank_options[] = {
+	{"none", HNSW_RERANK_NONE},
+	{"ntq10", HNSW_RERANK_NTQ10},
+	{"ntq12", HNSW_RERANK_NTQ12},
+	{"exact", HNSW_RERANK_EXACT},
+	{(const char *) NULL}
+};
+
 static const struct config_enum_entry hnsw_iterative_scan_options[] = {
 	{"off", HNSW_ITERATIVE_SCAN_OFF, false},
 	{"relaxed_order", HNSW_ITERATIVE_SCAN_RELAXED, false},
@@ -98,6 +112,12 @@ HnswInit(void)
 					  HNSW_DEFAULT_M, HNSW_MIN_M, HNSW_MAX_M, AccessExclusiveLock);
 	add_int_reloption(hnsw_relopt_kind, "ef_construction", "Size of the dynamic candidate list for construction",
 					  HNSW_DEFAULT_EF_CONSTRUCTION, HNSW_MIN_EF_CONSTRUCTION, HNSW_MAX_EF_CONSTRUCTION, AccessExclusiveLock);
+	add_enum_reloption(hnsw_relopt_kind, "quantizer", "Experimental quantizer for navigation codes",
+					   hnsw_quantizer_options, HNSW_QUANTIZER_NONE, "Valid values are \"none\" and \"tq4\".", AccessExclusiveLock);
+	add_enum_reloption(hnsw_relopt_kind, "rerank", "Re-rank payload for quantized indexes",
+					   hnsw_rerank_options, HNSW_RERANK_NTQ12, "Valid values are \"none\", \"ntq10\", \"ntq12\", and \"exact\".", AccessExclusiveLock);
+
+	HnswTqInitTables();
 
 	DefineCustomIntVariable("hnsw.ef_search", "Sets the size of the dynamic candidate list for search",
 							"Valid range is 1..1000.", &hnsw_ef_search,
@@ -257,6 +277,8 @@ hnswoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"m", RELOPT_TYPE_INT, offsetof(HnswOptions, m)},
 		{"ef_construction", RELOPT_TYPE_INT, offsetof(HnswOptions, efConstruction)},
+		{"quantizer", RELOPT_TYPE_ENUM, offsetof(HnswOptions, quantizer)},
+		{"rerank", RELOPT_TYPE_ENUM, offsetof(HnswOptions, rerank)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate,

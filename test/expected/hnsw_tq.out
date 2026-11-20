@@ -1,0 +1,160 @@
+SET enable_seqscan = off;
+-- L2 with exact re-rank
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = tq4, rerank = exact);
+INSERT INTO t (val) VALUES ('[1,2,4]');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   
+---------
+ [1,2,3]
+ [1,2,4]
+ [1,1,1]
+ [0,0,0]
+(4 rows)
+
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <-> (SELECT NULL::vector)) t2;
+ count 
+-------
+     4
+(1 row)
+
+SELECT COUNT(*) FROM t;
+ count 
+-------
+     5
+(1 row)
+
+TRUNCATE t;
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ val 
+-----
+(0 rows)
+
+DROP TABLE t;
+-- L2 with nested re-rank codes
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = tq4, rerank = ntq12);
+INSERT INTO t (val) VALUES ('[1,2,4]');
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+   val   
+---------
+ [1,2,3]
+ [1,2,4]
+ [1,1,1]
+ [0,0,0]
+(4 rows)
+
+DROP TABLE t;
+-- inner product
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_ip_ops) WITH (quantizer = tq4, rerank = ntq10);
+INSERT INTO t (val) VALUES ('[1,2,4]');
+SELECT * FROM t ORDER BY val <#> '[3,3,3]';
+   val   
+---------
+ [1,2,4]
+ [1,2,3]
+ [1,1,1]
+ [0,0,0]
+(4 rows)
+
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <#> (SELECT NULL::vector)) t2;
+ count 
+-------
+     4
+(1 row)
+
+DROP TABLE t;
+-- cosine
+CREATE TABLE t (val vector(3));
+INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+CREATE INDEX ON t USING hnsw (val vector_cosine_ops) WITH (quantizer = tq4, rerank = exact);
+INSERT INTO t (val) VALUES ('[1,2,4]');
+SELECT * FROM t ORDER BY val <=> '[3,3,3]';
+   val   
+---------
+ [1,1,1]
+ [1,2,3]
+ [1,2,4]
+(3 rows)
+
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <=> '[0,0,0]') t2;
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE t;
+-- recall, inserts, and vacuum
+SELECT setseed(0.5);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE t (id int, val vector(64));
+INSERT INTO t SELECT i, ARRAY(SELECT random()::real FROM generate_series(1, 64) g WHERE g > -i)::vector FROM generate_series(1, 1000) i;
+CREATE INDEX t_idx ON t USING hnsw (val vector_l2_ops) WITH (quantizer = tq4, rerank = ntq12);
+INSERT INTO t SELECT i, ARRAY(SELECT random()::real FROM generate_series(1, 64) g WHERE g > -i)::vector FROM generate_series(1001, 2000) i;
+SET hnsw.ef_search = 100;
+CREATE FUNCTION tq_recall() RETURNS float AS $$
+	SELECT SUM((
+		SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY val <-> q.val LIMIT 10) a
+		WHERE a.id IN (SELECT id FROM t ORDER BY (val <-> q.val) + 0 LIMIT 10)
+	))::float / (10 * COUNT(*))
+	FROM (SELECT val FROM t WHERE id % 100 = 0) q
+$$ LANGUAGE SQL;
+SELECT tq_recall() >= 0.9 AS recall_ok;
+ recall_ok 
+-----------
+ t
+(1 row)
+
+CREATE TABLE deleted AS SELECT * FROM t WHERE id % 2 = 0;
+DELETE FROM t WHERE id % 2 = 0;
+VACUUM t;
+SELECT pg_relation_size('t_idx') AS size_before \gset
+INSERT INTO t SELECT * FROM deleted;
+SELECT pg_relation_size('t_idx') = :size_before AS slots_reused;
+ slots_reused 
+--------------
+ t
+(1 row)
+
+SELECT COUNT(*) FROM t;
+ count 
+-------
+  2000
+(1 row)
+
+SELECT tq_recall() >= 0.9 AS recall_ok;
+ recall_ok 
+-----------
+ t
+(1 row)
+
+-- iterative scans are not supported yet
+SET hnsw.iterative_scan = relaxed_order;
+SELECT id FROM t ORDER BY val <-> (SELECT val FROM t WHERE id = 1) LIMIT 1;
+ERROR:  iterative scans are not supported for quantized hnsw indexes
+RESET hnsw.iterative_scan;
+DROP FUNCTION tq_recall();
+DROP TABLE t, deleted;
+-- options and unsupported opclasses and types
+CREATE TABLE t (val vector(3));
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = tq8);
+ERROR:  invalid value for enum option "quantizer": tq8
+DETAIL:  Valid values are "none" and "tq4".
+CREATE INDEX ON t USING hnsw (val vector_l2_ops) WITH (quantizer = tq4, rerank = ntq16);
+ERROR:  invalid value for enum option "rerank": ntq16
+DETAIL:  Valid values are "none", "ntq10", "ntq12", and "exact".
+CREATE INDEX ON t USING hnsw (val vector_l1_ops) WITH (quantizer = tq4);
+ERROR:  quantizer is only supported with vector_l2_ops, vector_ip_ops, and vector_cosine_ops
+DROP TABLE t;
+CREATE TABLE t (val halfvec(3));
+CREATE INDEX ON t USING hnsw (val halfvec_l2_ops) WITH (quantizer = tq4);
+ERROR:  quantizer is only supported for the vector type
+DROP TABLE t;
