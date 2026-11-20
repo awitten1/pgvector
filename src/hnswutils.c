@@ -163,6 +163,7 @@ HnswInitSupport(HnswSupport * support, Relation index)
 	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
 	support->collation = index->rd_indcollation[0];
 	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+	support->tq = HnswTqLoadState(index);
 }
 
 /*
@@ -447,9 +448,11 @@ HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo *
  * Set element tuple, except for neighbor info
  */
 void
-HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
+HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element, Pointer valuePtr)
 {
-	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+	/* Value defaults to element value (quantized indexes pass the code) */
+	if (valuePtr == NULL)
+		valuePtr = HnswPtrAccess(base, element->value);
 
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
@@ -528,7 +531,13 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 	if (loadVec)
 	{
 		char	   *base = NULL;
-		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+		Datum		value;
+
+		/* Decode quantized codes for distance computations */
+		if (HnswTqMarker(&etup->data) == HNSW_TQ_CODE_MARKER)
+			value = PointerGetDatum(HnswTqDecodeCode((HnswTqCode *) &etup->data));
+		else
+			value = datumCopy(PointerGetDatum(&etup->data), false, -1);
 
 		HnswPtrStore(base, element->value, (char *) DatumGetPointer(value));
 	}
@@ -540,6 +549,9 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 static inline double
 HnswGetDistance(Datum a, Datum b, HnswSupport * support)
 {
+	if (unlikely(support->tq != NULL))
+		return HnswTqValueDistance(support, a, b);
+
 	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
@@ -568,6 +580,8 @@ HnswLoadElementImpl(Buffer buf, OffsetNumber offno, double *distance, HnswQuery 
 	{
 		if (DatumGetPointer(q->value) == NULL)
 			*distance = 0;
+		else if (support->tq != NULL)
+			*distance = HnswTqCodeDistance(support->tq, q->value, (HnswTqCode *) &etup->data);
 		else
 			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
 	}

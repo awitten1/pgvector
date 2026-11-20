@@ -43,6 +43,10 @@ GetScanItems(IndexScanDesc scan, Datum value)
 	if (DatumGetPointer(value) != NULL)
 		HnswCheckDim(dimensions, so->typeInfo, support->collation, value);
 
+	/* Quantized indexes compute distances in the rotated space */
+	if (support->tq != NULL && DatumGetPointer(value) != NULL)
+		value = HnswTqMakeValue(support->tq, value, support->tq->rerank == HNSW_RERANK_EXACT);
+
 	q->value = value;
 	so->m = m;
 
@@ -57,7 +61,13 @@ GetScanItems(IndexScanDesc scan, Datum value)
 		ep = w;
 	}
 
-	return HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->searchState);
+	w = HnswSearchLayer(base, q, ep, hnsw_ef_search, 0, index, support, m, false, NULL, &so->v, hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF ? &so->discarded : NULL, true, &so->tuples, &so->searchState);
+
+	/* Re-rank navigation results for quantized indexes */
+	if (support->tq != NULL && DatumGetPointer(value) != NULL)
+		w = HnswTqRerank(index, support, q, w);
+
+	return w;
 }
 
 /*
@@ -224,6 +234,12 @@ hnswgettuple(IndexScanDesc scan, ScanDirection dir)
 		/* https://www.postgresql.org/docs/current/index-locking.html */
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with hnsw");
+
+		/* Iterative scans are not implemented for quantized indexes yet */
+		if (so->support.tq != NULL && hnsw_iterative_scan != HNSW_ITERATIVE_SCAN_OFF)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("iterative scans are not supported for quantized hnsw indexes")));
 
 		/* Get scan value */
 		value = GetScanValue(scan);

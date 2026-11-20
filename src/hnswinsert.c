@@ -146,7 +146,7 @@ HnswInsertAppendPage(Relation index, Buffer *nbuf, Page *npage, GenericXLogState
  * Add to element and neighbor pages
  */
 static void
-AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInsertPage, bool building)
+AddElementOnDisk(Relation index, HnswSupport * support, HnswElement e, int m, BlockNumber *updatedInsertPage, bool building)
 {
 	Buffer		buf;
 	Page		page;
@@ -172,9 +172,26 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInser
 	int			fsmTries = 0;
 	bool		fsmPage;
 	BlockNumber fsmHistory[HNSW_MAX_FSM_TRIES];
+	Pointer		valuePtr = HnswPtrAccess(base, e->value);
+
+	/*
+	 * For quantized indexes, store the 4-bit code as the value. The re-rank
+	 * tuple is added first, without holding any graph page locks.
+	 */
+	if (support->tq != NULL)
+	{
+		HnswRerankTuple rtup;
+		Size		rtupSize;
+		HnswTqCode *code = HnswTqEncode(support->tq, PointerGetDatum(valuePtr), &rtup, &rtupSize);
+
+		if (rtup != NULL)
+			HnswTqAddRerankTuple(index, rtup, rtupSize, &code->reranktid, building);
+
+		valuePtr = (Pointer) code;
+	}
 
 	/* Calculate sizes */
-	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(HnswPtrAccess(base, e->value)));
+	etupSize = HNSW_ELEMENT_TUPLE_SIZE(VARSIZE_ANY(valuePtr));
 	ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(e->level, m);
 	combinedSize = etupSize + ntupSize + sizeof(ItemIdData);
 	maxSize = HNSW_MAX_SIZE;
@@ -182,7 +199,7 @@ AddElementOnDisk(Relation index, HnswElement e, int m, BlockNumber *updatedInser
 
 	/* Prepare element tuple */
 	etup = palloc0(etupSize);
-	HnswSetElementTuple(base, etup, e);
+	HnswSetElementTuple(base, etup, e, valuePtr);
 
 	/* Prepare neighbor tuple */
 	ntup = palloc0(ntupSize);
@@ -739,7 +756,7 @@ UpdateGraphOnDisk(Relation index, HnswSupport * support, HnswElement element, in
 		return;
 
 	/* Add element */
-	AddElementOnDisk(index, element, m, &newInsertPage, building);
+	AddElementOnDisk(index, support, element, m, &newInsertPage, building);
 
 	/* Update insert page if needed */
 	if (BlockNumberIsValid(newInsertPage))
@@ -779,6 +796,10 @@ HnswInsertTupleOnDisk(Relation index, const HnswTypeInfo * typeInfo, HnswSupport
 
 	/* Check dimensions match index */
 	HnswCheckDim(dimensions, typeInfo, support->collation, value);
+
+	/* Quantized indexes compute distances in the rotated space */
+	if (support->tq != NULL)
+		value = HnswTqMakeValue(support->tq, value, support->tq->rerank == HNSW_RERANK_EXACT);
 
 	/* Create an element */
 	element = HnswInitElement(base, heaptid, m, HnswGetMl(m), HnswGetMaxLevel(m), NULL);
