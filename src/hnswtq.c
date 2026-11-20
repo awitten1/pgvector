@@ -19,6 +19,7 @@
 #include "access/generic_xlog.h"
 #include "hnsw.h"
 #include "hnswtq_tables.h"
+#include "hnswtq_simd.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/lsyscache.h"
@@ -512,22 +513,8 @@ HnswTqValueDistance(const HnswSupport * support, Datum a, Datum b)
 static float
 TqNavDot(const float *qr, const uint8 *code, int pdim)
 {
-	float		acc0 = 0;
-	float		acc1 = 0;
-	int			half = pdim / 2;
-
-	for (int i = 0; i < half; i++)
-	{
-		uint8		b = code[i];
-
-		acc0 += qr[2 * i] * tq4_lut[b & 0x0F];
-		acc1 += qr[2 * i + 1] * tq4_lut[b >> 4];
-	}
-
-	if (pdim & 1)
-		acc0 += qr[pdim - 1] * tq4_lut[code[half] & 0x0F];
-
-	return acc0 + acc1;
+	/* AVX2 register lookup, not gathers (hnswtq_simd.h) */
+	return TqNavDotFast(qr, code, pdim, hnsw_tq4_centroids, tq4_lut);
 }
 
 /*
@@ -576,20 +563,6 @@ TqPutBits(uint8 *buf, int i, int k, uint32 v)
 		if ((v >> b) & 1)
 			buf[(off + b) >> 3] |= (uint8) (1 << ((off + b) & 7));
 	}
-}
-
-static inline uint32
-TqGetBits(const uint8 *buf, int i, int k)
-{
-	uint32		off;
-	uint32		w;
-
-	if (k == 8)
-		return buf[i];
-
-	off = (uint32) i * k;
-	w = (uint32) buf[off >> 3] | ((uint32) buf[(off >> 3) + 1] << 8);
-	return (w >> (off & 7)) & ((1U << k) - 1);
 }
 
 static inline const float *
@@ -729,17 +702,8 @@ HnswTqEncode(const HnswTqState * tq, Datum value, HnswRerankTuple * rtupOut, Siz
 static float
 TqRefineDot(const float *qr, const uint8 *code, const uint8 *ref, int pdim, int k)
 {
-	float		acc = 0;
-
-	for (int i = 0; i < pdim; i++)
-	{
-		int			nib = TqNibble(code, i);
-		float		c = TqRefineCells(k, nib & 7)[TqGetBits(ref, i, k)];
-
-		acc += qr[i] * (nib & 8 ? -c : c);
-	}
-
-	return acc;
+	/* k-specialized loop (hnswtq_simd.h); k is 6 or 8 */
+	return TqRefineDotFast(qr, code, ref, pdim, k, k == 6 ? &hnsw_tq_ref6[0][0] : &hnsw_tq_ref8[0][0]);
 }
 
 /*
